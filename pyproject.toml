@@ -10,5 +10,6 @@ dependencies = [
     "Cython",
     "packaging",
     "nemo_toolkit['asr']",
-    "Flask",
+    "fastapi",
+    "uvicorn",
 ]

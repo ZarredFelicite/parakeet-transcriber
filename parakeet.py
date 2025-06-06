@@ -7,8 +7,9 @@ import nemo.collections.asr as nemo_asr
 from pydub import AudioSegment
 import tempfile
 import math
-from flask import Flask, request, jsonify # Added Flask imports
-from werkzeug.utils import secure_filename # For securing uploaded filenames
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+import shutil # Needed for saving the uploaded file
 
 # Global variable for the ASR model
 ASR_MODEL = None
@@ -111,82 +112,75 @@ def process_and_transcribe_audio_file(audio_path: str, segment_length_sec: int =
                 os.remove(temp_file_path)
         print("Temporary segment files for this transcription cleaned up.")
 
-# --- Flask App Definition and Server Mode ---
-app = Flask(__name__)
+# --- FastAPI App Definition and Server Mode ---
+app = FastAPI()
 
-def run_server_mode(host='0.0.0.0', port=5000, segment_length_sec=60):
-    """Initializes and runs the Flask server for transcription."""
-    load_model()  # Load the model once when the server starts
-    print(f"Starting Parakeet ASR server on http://{host}:{port}")
-    print(f"Using segment length for transcription: {segment_length_sec} seconds.")
+@app.post("/transcribe")
+async def transcribe_endpoint(audio_file: UploadFile = File(...)):
+    """
+    Receives an audio file via POST request and returns the transcription.
+    """
+    # FastAPI handles file uploads differently.
+    # We need to save the uploaded file to a temporary location.
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_audio_path = os.path.join(temp_dir, audio_file.filename)
+            with open(temp_audio_path, "wb") as buffer:
+                shutil.copyfileobj(audio_file.file, buffer)
 
-    @app.route('/transcribe', methods=['POST'])
-    def transcribe_endpoint():
-        if 'audio_file' not in request.files:
-            return jsonify({"error": "No 'audio_file' part in the request"}), 400
-        
-        file = request.files['audio_file']
-        if file.filename == '':
-            return jsonify({"error": "No selected file"}), 400
+            print(f"Received file for transcription: {audio_file.filename}")
 
-        if file:
-            filename = secure_filename(file.filename) # Secure the filename
-            # Create a temporary directory for the uploaded file
-            with tempfile.TemporaryDirectory() as temp_dir:
-                temp_audio_path = os.path.join(temp_dir, filename)
-                file.save(temp_audio_path)
-                
-                print(f"Received file for transcription: {filename}")
-                
-                try:
-                    transcription = process_and_transcribe_audio_file(temp_audio_path, segment_length_sec)
-                    
-                    if transcription.startswith("Error:") or "[Transcription Failed for Segment]" in transcription:
-                         return jsonify({"error": "Transcription failed or error during processing", "details": transcription}), 500
-                    return jsonify({"transcription": transcription})
-                except Exception as e:
-                    print(f"Error handling transcription request for {filename}: {e}")
-                    return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
-        
-        return jsonify({"error": "File processing failed for an unknown reason"}), 500
+            # Access segment_length_sec from app.state
+            segment_length_sec = app.state.segment_length_sec
+            transcription = process_and_transcribe_audio_file(temp_audio_path, segment_length_sec)
 
-    app.run(host=host, port=port, debug=False) # Set debug=False for production
+            if transcription.startswith("Error:") or "[Transcription Failed for Segment]" in transcription:
+                 return JSONResponse({"error": "Transcription failed or error during processing", "details": transcription}, status_code=500)
+            return JSONResponse({"transcription": transcription})
+    except Exception as e:
+        print(f"Error handling transcription request for {audio_file.filename}: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Transcribe an audio file using Parakeet TDT or run as a transcription server.")
-    
-    parser.add_argument("audio_file", nargs='?', default=None, 
+
+    parser.add_argument("audio_file", nargs='?', default=None,
                         help="Path to the audio file (WAV or MP3) for CLI mode. Not used if --server is specified.")
-    
+
     parser.add_argument("--segment_length", type=int, default=60,
                         help="Length of audio segments in seconds (default: 60). "
                              "Applies to both CLI and server mode processing. "
                              "Decrease if you encounter out-of-memory errors.")
-    
-    parser.add_argument("--server", action="store_true", 
+
+    parser.add_argument("--server", action="store_true",
                         help="Run in server mode. If this flag is set, 'audio_file' argument is ignored.")
-    parser.add_argument("--host", type=str, default="0.0.0.0", 
+    parser.add_argument("--host", type=str, default="0.0.0.0",
                         help="Host for the server (default: '0.0.0.0'). Only used with --server.")
-    parser.add_argument("--port", type=int, default=5000, 
+    parser.add_argument("--port", type=int, default=5000,
                         help="Port for the server (default: 5000). Only used with --server.")
 
     args = parser.parse_args()
 
     if args.server:
-        run_server_mode(host=args.host, port=args.port, segment_length_sec=args.segment_length)
+        load_model() # Load model when server starts
+        print(f"Starting Parakeet ASR server with FastAPI/Uvicorn on http://{args.host}:{args.port}")
+        # Store segment_length_sec in app.state for access in the endpoint
+        app.state.segment_length_sec = args.segment_length
+        import uvicorn
+        uvicorn.run(app, host=args.host, port=args.port)
     else:
         if args.audio_file is None:
             parser.error("The 'audio_file' argument is required when not running in --server mode.")
-        
+
         print(f"Running in CLI mode for audio file: {args.audio_file}")
         # process_and_transcribe_audio_file calls load_model() internally.
         final_transcription = process_and_transcribe_audio_file(args.audio_file, args.segment_length)
-        
+
         if final_transcription.startswith("Error:") or "[Transcription Failed for Segment]" in final_transcription:
             print(f"\nCLI Transcription Failed/Error: {final_transcription}")
         else:
             print("\nFull Transcription:")
             print(final_transcription)
-        
+
         print("CLI transcription process complete.")

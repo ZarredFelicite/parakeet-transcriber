@@ -1,6 +1,6 @@
 # Parakeet Audio Transcription
 
-This project provides a tool for audio transcription using the NVIDIA NeMo Parakeet TDT (Text-Dependent Transcription) model. It can be used via a command-line interface or as a Flask web server.
+This project provides a tool for audio transcription using the NVIDIA NeMo Parakeet TDT (Text-Dependent Transcription) model. It can be used via a command-line interface or as a FastAPI web server.
 
 ## Features
 
@@ -8,7 +8,7 @@ This project provides a tool for audio transcription using the NVIDIA NeMo Parak
 *   Supports WAV and MP3 audio formats.
 *   Automatic conversion to mono and resampling to 16kHz for compatibility with the ASR model.
 *   Splits long audio files into segments for efficient processing.
-*   Provides both a Command-Line Interface (CLI) and a Flask web server mode.
+*   Provides both a Command-Line Interface (CLI) and a FastAPI web server mode.
 *   Basic error handling for file operations.
 *   Cleans up temporary audio segment files after transcription.
 
@@ -54,7 +54,7 @@ python parakeet.py my_audio.mp3 --segment_length 30
 
 ### Server Mode
 
-To run the transcription as a Flask web server:
+To run the transcription as a FastAPI web server:
 
 ```bash
 python parakeet.py --server
@@ -95,9 +95,11 @@ The main Python dependencies are managed via `pyproject.toml` and installed by `
 *   `Cython`
 *   `packaging`
 *   `nemo_toolkit['asr']`
-*   `Flask`
+*   `fastapi`
+*   `uvicorn`
 *   `pydub`
 *   `werkzeug`
+*   `shutil` # For file handling in FastAPI endpoint
 
 System-level dependencies, including CUDA and FFmpeg, are handled by the Nix environment defined in `flake.nix`.
 
