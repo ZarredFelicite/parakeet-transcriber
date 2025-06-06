@@ -171,12 +171,8 @@ def process_and_transcribe_audio_file(input_path: str, segment_length_sec: int =
         final_transcription = " ".join(all_transcriptions)
         return final_transcription
 
-    except FileNotFoundError:
-        error_msg = "Error: Required library (like FFmpeg for some audio formats) might not be installed or found. Please ensure FFmpeg is installed and in your system's PATH."
-        print(error_msg)
-        return error_msg
     except Exception as e:
-        error_msg = f"An error occurred during audio processing: {e}"
+        error_msg = f"An error occurred during audio processing: {type(e).__name__}: {e}"
         print(error_msg)
         return error_msg
     finally:
