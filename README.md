@@ -5,7 +5,7 @@ This project provides a tool for audio transcription using the NVIDIA NeMo Parak
 ## Features
 
 *   Audio transcription using the powerful Parakeet TDT model.
-*   Supports WAV and MP3 audio formats.
+*   Supports various audio (WAV, MP3) and video (MP4, MKV, AVI, MOV, WMV, FLV) formats by extracting the audio stream.
 *   Automatic conversion to mono and resampling to 16kHz for compatibility with the ASR model.
 *   Splits long audio files into segments for efficient processing.
 *   Provides both a Command-Line Interface (CLI) and a FastAPI web server mode.
@@ -38,13 +38,13 @@ Once you are in the Nix development environment (`nix develop`), you can use the
 
 ### CLI Mode
 
-To transcribe a single audio file from the command line:
+To transcribe a single audio or video file from the command line:
 
 ```bash
-python parakeet.py [audio_filename.wav]
+python parakeet.py [input_file_path]
 ```
 
-Replace `[audio_filename.wav]` with the path to your audio file (WAV or MP3).
+Replace `[input_file_path]` with the path to your audio (WAV, MP3) or video (MP4, MKV, AVI, MOV, WMV, FLV) file.
 
 You can also specify the segment length for processing using the `--segment_length` argument (default is 60 seconds):
 
@@ -66,13 +66,14 @@ By default, the server will run on `http://0.0.0.0:5000`. You can customize the 
 python parakeet.py --server --host 127.0.0.1 --port 8000
 ```
 
-The server exposes a `/transcribe` endpoint that accepts POST requests with an audio file in the `audio_file` form data field.
+The server exposes a `/transcribe` endpoint that accepts POST requests with an audio or video file in the `audio_file` form data field.
 
 Example using `curl`:
 
 ```bash
-curl -X POST -F "audio_file=@/path/to/your/audio.wav" http://127.0.0.1:5000/transcribe
+curl -X POST -F "audio_file=@/path/to/your/input_file.mp4" http://127.0.0.1:5000/transcribe
 ```
+Replace `.mp4` with the actual file extension of your audio or video file.
 
 The server will return a JSON response containing the transcription:
 

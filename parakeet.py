@@ -24,32 +24,105 @@ def load_model():
         print("Model loaded and moved to GPU.")
     return ASR_MODEL
 
-def process_and_transcribe_audio_file(audio_path: str, segment_length_sec: int = 60) -> str:
+import subprocess # For running ffmpeg
+
+def extract_audio_from_video(video_path: str, output_dir: str) -> str:
     """
-    Processes an audio file (WAV or MP3), ensuring it's mono and 16kHz,
+    Extracts audio from a video file using ffmpeg and saves it as a WAV file.
+    Args:
+        video_path (str): The path to the video file.
+        output_dir (str): The directory to save the extracted audio file.
+    Returns:
+        str: The path to the extracted WAV audio file.
+    Raises:
+        Exception: If ffmpeg command fails.
+    """
+    base_name = os.path.basename(video_path)
+    audio_filename = f"{os.path.splitext(base_name)[0]}.wav"
+    output_audio_path = os.path.join(output_dir, audio_filename)
+
+    # ffmpeg command to extract audio and convert to WAV (mono, 16kHz)
+    # -i: input file
+    # -vn: no video
+    # -acodec pcm_s16le: audio codec (16-bit signed little-endian PCM)
+    # -ac 1: audio channels (mono)
+    # -ar 16000: audio sample rate (16kHz)
+    # -y: overwrite output file without asking
+    command = [
+        "ffmpeg",
+        "-i", video_path,
+        "-vn",
+        "-acodec", "pcm_s16le",
+        "-ac", "1",
+        "-ar", "16000",
+        "-y",
+        output_audio_path
+    ]
+
+    print(f"Extracting audio from video: {video_path}")
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+        print(f"Audio extracted to: {output_audio_path}")
+        return output_audio_path
+    except subprocess.CalledProcessError as e:
+        print(f"Error during audio extraction: {e}")
+        print(f"ffmpeg stdout: {e.stdout}")
+        print(f"ffmpeg stderr: {e.stderr}")
+        raise Exception(f"ffmpeg audio extraction failed: {e.stderr}")
+    except FileNotFoundError:
+        raise FileNotFoundError("Error: ffmpeg not found. Please ensure ffmpeg is installed and in your system's PATH.")
+    except Exception as e:
+        raise Exception(f"An unexpected error occurred during audio extraction: {e}")
+
+
+def process_and_transcribe_audio_file(input_path: str, segment_length_sec: int = 60) -> str:
+    """
+    Processes an audio file (or extracts audio from video), ensuring it's mono and 16kHz,
     splits it into segments, transcribes them, and returns the full transcription.
     Assumes the ASR model is already loaded via load_model().
     Args:
-        audio_path (str): The path to the audio file.
+        input_path (str): The path to the audio or video file.
         segment_length_sec (int): The length of each audio segment in seconds.
     Returns:
         str: The full transcription or an error message.
     """
     asr_model = load_model() # Ensures model is loaded and gets the instance
-    original_audio_path = audio_path
+    original_input_path = input_path # Keep track of the original input path
     temp_files = [] # To keep track of temporary segment files
     all_transcriptions = [] # Initialize list to store transcriptions of segments
+    audio_for_processing_path = original_input_path # Path to the audio file to process
 
     try:
         # Ensure the file exists
-        if not os.path.exists(original_audio_path):
-            print(f"Error: Audio file not found at {original_audio_path}")
-            return
+        if not os.path.exists(original_input_path):
+            print(f"Error: Input file not found at {original_input_path}")
+            return f"Error: Input file not found at {original_input_path}"
 
-        print(f"Processing audio file: {os.path.basename(original_audio_path)}")
+        print(f"Processing input file: {os.path.basename(original_input_path)}")
+
+        # Check file extension to determine if it's a video
+        file_extension = os.path.splitext(original_input_path)[1].lower()
+        video_extensions = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv'] # Add more as needed
+
+        if file_extension in video_extensions:
+            print(f"Detected video file: {os.path.basename(original_input_path)}. Extracting audio...")
+            # Create a temporary directory for the extracted audio
+            with tempfile.TemporaryDirectory() as temp_dir_for_extracted_audio:
+                 extracted_audio_path = extract_audio_from_video(original_input_path, temp_dir_for_extracted_audio)
+                 audio_for_processing_path = extracted_audio_path
+                 # The temporary directory will be cleaned up automatically,
+                 # but the extracted file path is what we pass to pydub.
+                 # pydub might create its own temp files, which are handled below.
+                 # We don't need to add extracted_audio_path to temp_files here
+                 # because its parent temp_dir_for_extracted_audio is managed by the 'with' statement.
+        else:
+            print(f"Detected audio file: {os.path.basename(original_input_path)}")
+            audio_for_processing_path = original_input_path
+
 
         # Load the audio file using pydub
-        audio = AudioSegment.from_file(original_audio_path)
+        # Use the extracted audio path if it was a video, otherwise use the original path
+        audio = AudioSegment.from_file(audio_for_processing_path)
 
         # Check and convert to mono if necessary
         if audio.channels > 1:
@@ -118,21 +191,22 @@ app = FastAPI()
 @app.post("/transcribe")
 async def transcribe_endpoint(audio_file: UploadFile = File(...)):
     """
-    Receives an audio file via POST request and returns the transcription.
+    Receives an audio or video file via POST request and returns the transcription.
     """
     # FastAPI handles file uploads differently.
     # We need to save the uploaded file to a temporary location.
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
-            temp_audio_path = os.path.join(temp_dir, audio_file.filename)
-            with open(temp_audio_path, "wb") as buffer:
+            temp_input_path = os.path.join(temp_dir, audio_file.filename)
+            with open(temp_input_path, "wb") as buffer:
                 shutil.copyfileobj(audio_file.file, buffer)
 
             print(f"Received file for transcription: {audio_file.filename}")
 
             # Access segment_length_sec from app.state
             segment_length_sec = app.state.segment_length_sec
-            transcription = process_and_transcribe_audio_file(temp_audio_path, segment_length_sec)
+            # Pass the temporary input path to the processing function
+            transcription = process_and_transcribe_audio_file(temp_input_path, segment_length_sec)
 
             if transcription.startswith("Error:") or "[Transcription Failed for Segment]" in transcription:
                  return JSONResponse({"error": "Transcription failed or error during processing", "details": transcription}, status_code=500)
@@ -173,7 +247,7 @@ if __name__ == "__main__":
         if args.audio_file is None:
             parser.error("The 'audio_file' argument is required when not running in --server mode.")
 
-        print(f"Running in CLI mode for audio file: {args.audio_file}")
+        print(f"Running in CLI mode for input file: {args.audio_file}")
         # process_and_transcribe_audio_file calls load_model() internally.
         final_transcription = process_and_transcribe_audio_file(args.audio_file, args.segment_length)
 
