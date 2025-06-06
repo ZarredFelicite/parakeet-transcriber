@@ -102,7 +102,7 @@ def process_and_transcribe_audio_file(input_path: str, segment_length_sec: int =
 
         # Check file extension to determine if it's a video
         file_extension = os.path.splitext(original_input_path)[1].lower()
-        video_extensions = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv'] # Add more as needed
+        video_extensions = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm'] # Add more as needed
 
         if file_extension in video_extensions:
             print(f"Detected video file: {os.path.basename(original_input_path)}. Extracting audio...")

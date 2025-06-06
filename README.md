@@ -5,7 +5,7 @@ This project provides a tool for audio transcription using the NVIDIA NeMo Parak
 ## Features
 
 *   Audio transcription using the powerful Parakeet TDT model.
-*   Supports various audio (WAV, MP3) and video (MP4, MKV, AVI, MOV, WMV, FLV) formats by extracting the audio stream.
+*   Supports various audio (WAV, MP3) and video (MP4, MKV, AVI, MOV, WMV, FLV, WebM) formats by extracting the audio stream.
 *   Automatic conversion to mono and resampling to 16kHz for compatibility with the ASR model.
 *   Splits long audio files into segments for efficient processing.
 *   Provides both a Command-Line Interface (CLI) and a FastAPI web server mode.
