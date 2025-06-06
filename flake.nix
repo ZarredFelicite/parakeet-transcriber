@@ -38,10 +38,8 @@
 
         start = pkgs.writeScriptBin "start" ''
           #!/usr/bin/env sh
-          if [ "$(hostname)" = "web" ]; then
-            echo 'Running Parakeet STT server'
-            python parakeet.py --server --port 5001
-          fi
+          echo 'Running Parakeet STT server'
+          python parakeet.py --server --port 5001
         '';
 
         libPath = pkgs.lib.makeLibraryPath buildInputs;
