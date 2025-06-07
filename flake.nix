@@ -23,6 +23,8 @@
           libuv
           zlib
           ffmpeg
+          libgcc
+          portaudio
         ];
 
         devTools = with pkgs; [

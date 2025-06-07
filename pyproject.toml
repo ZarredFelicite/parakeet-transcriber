@@ -12,4 +12,8 @@ dependencies = [
     "nemo_toolkit['asr']",
     "fastapi",
     "uvicorn",
+    "python-multipart",
+    "pyaudio",
+    "websockets",
+    "webrtcvad",
 ]

@@ -1,30 +1,47 @@
-# How to use:
-# In the command line (bash) type (or use python if not python3): python3 transcribe_script.py [audio_filename.wav]
-
 import argparse
 import os
 import nemo.collections.asr as nemo_asr
 from pydub import AudioSegment
 import tempfile
 import math
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 import shutil # Needed for saving the uploaded file
+import subprocess # For running ffmpeg
+import numpy as np
+import difflib
+import time
+from collections import deque
+import asyncio
 
 # Global variable for the ASR model
 ASR_MODEL = None
+
+def check_ffmpeg_in_path():
+    """Checks if ffmpeg is available in the system's PATH."""
+    print("Checking for ffmpeg in PATH...")
+    try:
+        subprocess.run(["ffmpeg", "-version"], check=True, capture_output=True, text=True)
+        print("ffmpeg found in PATH.")
+    except FileNotFoundError:
+        raise FileNotFoundError("Error: ffmpeg not found in your system's PATH. Please install ffmpeg to process video files.")
+    except Exception as e:
+        print(f"An unexpected error occurred while checking for ffmpeg: {e}")
+        # Still raise FileNotFoundError for consistency with the intended check failure
+        raise FileNotFoundError("Error: Could not verify ffmpeg in PATH. Please ensure ffmpeg is installed and accessible.")
+
 
 def load_model():
     """Loads the ASR model into the global ASR_MODEL variable if not already loaded."""
     global ASR_MODEL
     if ASR_MODEL is None:
+        check_ffmpeg_in_path() # Check for ffmpeg before loading the model
         print("Loading Parakeet TDT model...")
         # Ensure the model is moved to the GPU if available
         ASR_MODEL = nemo_asr.models.ASRModel.from_pretrained(model_name="nvidia/parakeet-tdt-0.6b-v2").cuda()
         print("Model loaded and moved to GPU.")
     return ASR_MODEL
 
-import subprocess # For running ffmpeg
 
 def extract_audio_from_video(video_path: str, output_dir: str) -> str:
     """
@@ -70,7 +87,10 @@ def extract_audio_from_video(video_path: str, output_dir: str) -> str:
         print(f"ffmpeg stderr: {e.stderr}")
         raise Exception(f"ffmpeg audio extraction failed: {e.stderr}")
     except FileNotFoundError:
-        raise FileNotFoundError("Error: ffmpeg not found. Please ensure ffmpeg is installed and in your system's PATH.")
+        # This specific FileNotFoundError is for the ffmpeg command itself within subprocess.run
+        # The check_ffmpeg_in_path should ideally catch this earlier, but keeping this
+        # for robustness in case the PATH changes or ffmpeg becomes unavailable later.
+        raise FileNotFoundError("Error: ffmpeg not found during extraction. Please ensure ffmpeg is installed and in your system's PATH.")
     except Exception as e:
         raise Exception(f"An unexpected error occurred during audio extraction: {e}")
 
@@ -90,7 +110,7 @@ def process_and_transcribe_audio_file(input_path: str, segment_length_sec: int =
     original_input_path = input_path # Keep track of the original input path
     temp_files = [] # To keep track of temporary segment files
     all_transcriptions = [] # Initialize list to store transcriptions of segments
-    audio_for_processing_path = original_input_path # Path to the audio file to process
+    temp_dir = None # Initialize temp_dir to None
 
     try:
         # Ensure the file exists
@@ -100,28 +120,26 @@ def process_and_transcribe_audio_file(input_path: str, segment_length_sec: int =
 
         print(f"Processing input file: {os.path.basename(original_input_path)}")
 
+        # Create a temporary directory for extracted audio and segments
+        temp_dir = tempfile.TemporaryDirectory()
+        temp_dir_path = temp_dir.name
+
         # Check file extension to determine if it's a video
         file_extension = os.path.splitext(original_input_path)[1].lower()
         video_extensions = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm'] # Add more as needed
 
         if file_extension in video_extensions:
             print(f"Detected video file: {os.path.basename(original_input_path)}. Extracting audio...")
-            # Create a temporary directory for the extracted audio
-            with tempfile.TemporaryDirectory() as temp_dir_for_extracted_audio:
-                 extracted_audio_path = extract_audio_from_video(original_input_path, temp_dir_for_extracted_audio)
-                 audio_for_processing_path = extracted_audio_path
-                 # The temporary directory will be cleaned up automatically,
-                 # but the extracted file path is what we pass to pydub.
-                 # pydub might create its own temp files, which are handled below.
-                 # We don't need to add extracted_audio_path to temp_files here
-                 # because its parent temp_dir_for_extracted_audio is managed by the 'with' statement.
+            audio_for_processing_path = extract_audio_from_video(original_input_path, temp_dir_path)
         else:
             print(f"Detected audio file: {os.path.basename(original_input_path)}")
-            audio_for_processing_path = original_input_path
+            # If it's an audio file, copy it to the temporary directory for consistent handling
+            audio_filename = os.path.basename(original_input_path)
+            audio_for_processing_path = os.path.join(temp_dir_path, audio_filename)
+            shutil.copyfile(original_input_path, audio_for_processing_path)
 
 
         # Load the audio file using pydub
-        # Use the extracted audio path if it was a video, otherwise use the original path
         audio = AudioSegment.from_file(audio_for_processing_path)
 
         # Check and convert to mono if necessary
@@ -176,13 +194,210 @@ def process_and_transcribe_audio_file(input_path: str, segment_length_sec: int =
         print(error_msg)
         return error_msg
     finally:
+        # Clean up temporary segment files
         for temp_file_path in temp_files:
             if os.path.exists(temp_file_path):
                 os.remove(temp_file_path)
         print("Temporary segment files for this transcription cleaned up.")
+        # Clean up the main temporary directory
+        if temp_dir:
+            temp_dir.cleanup()
+            print(f"Temporary directory {temp_dir_path} cleaned up.")
+
 
 # --- FastAPI App Definition and Server Mode ---
 app = FastAPI()
+
+@app.websocket("/ws/transcribe")
+async def websocket_transcribe_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    asr_model = load_model()
+    
+    # Constants for audio processing
+    sample_rate = 16000
+    sample_width = 2  # 16-bit
+    channels = 1
+    
+    # Buffer settings
+    window_size_seconds = 5
+    step_size_seconds = 1
+    window_size_bytes = window_size_seconds * sample_rate * sample_width
+    step_size_bytes = step_size_seconds * sample_rate * sample_width
+
+    buffer = bytearray()
+    last_transcription = ""
+    
+    try:
+        is_initial_transcription = True
+        while True:
+            data = await websocket.receive_bytes()
+            buffer.extend(data)
+
+            if is_initial_transcription:
+                # For the first transcription, pad with silence to 5 seconds
+                if len(buffer) < window_size_bytes:
+                    silence_duration_ms = (window_size_bytes - len(buffer)) * 1000 // (sample_rate * sample_width)
+                    padding = AudioSegment.silent(duration=silence_duration_ms, frame_rate=sample_rate)
+                    audio_data = padding + AudioSegment(data=buffer, sample_width=sample_width, frame_rate=sample_rate, channels=channels)
+                else:
+                    audio_data = AudioSegment(data=buffer[:window_size_bytes], sample_width=sample_width, frame_rate=sample_rate, channels=channels)
+                    is_initial_transcription = False
+            else:
+                # Use a sliding window after the initial transcription
+                if len(buffer) < window_size_bytes:
+                    continue
+                audio_data = AudioSegment(data=buffer[:window_size_bytes], sample_width=sample_width, frame_rate=sample_rate, channels=channels)
+
+
+            # Create a temporary file for the audio data
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmpfile:
+                temp_wav_file_path = tmpfile.name
+                audio_data.export(temp_wav_file_path, format="wav")
+
+            # Transcribe the audio window
+            transcription_result = asr_model.transcribe([temp_wav_file_path])
+            os.remove(temp_wav_file_path)
+
+            current_transcription = ""
+            if transcription_result and len(transcription_result) > 0:
+                current_transcription = transcription_result[0].text.strip()
+
+            if app.state.verbose:
+                print(f"Segment Transcription: {current_transcription}")
+
+            # More robust segment matching
+            new_words = []
+            if last_transcription:
+                # Find the longest common subsequence
+                s = difflib.SequenceMatcher(None, last_transcription.split(), current_transcription.split())
+                match = s.find_longest_match(0, len(last_transcription.split()), 0, len(current_transcription.split()))
+                
+                if match.size > 0:
+                    # If there's a common subsequence, append the new words after it
+                    new_words = current_transcription.split()[match.b + match.size:]
+                else:
+                    # If no common subsequence, send the whole thing (fallback)
+                    new_words = current_transcription.split()
+            else:
+                # First transcription
+                new_words = current_transcription.split()
+
+            if new_words:
+                await websocket.send_text(" ".join(new_words))
+
+            last_transcription = current_transcription
+            
+            # Slide the buffer window
+            buffer = buffer[step_size_bytes:]
+
+    except WebSocketDisconnect:
+        print("Client disconnected from WebSocket.")
+    except Exception as e:
+        print(f"An error occurred in WebSocket: {e}")
+    finally:
+        await websocket.close()
+
+@app.websocket("/ws/transcribe_v2")
+async def websocket_transcribe_v2_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    asr_model = load_model()
+
+    # Constants
+    sample_rate = 16000
+    sample_width = 2
+    channels = 1
+    window_size_seconds = 15
+    min_audio_len_bytes = 5 * sample_rate * sample_width
+    window_size_bytes = window_size_seconds * sample_rate * sample_width
+
+    buffer = bytearray()
+    transcription_history = deque(maxlen=3)
+    last_sent_word = None
+    is_initial_transcription = True
+
+    try:
+        # Main transcription loop
+        while True:
+            try:
+                data = await asyncio.wait_for(websocket.receive_bytes(), timeout=0.25)
+                buffer.extend(data)
+            except asyncio.TimeoutError:
+                pass
+
+            if is_initial_transcription:
+                if len(buffer) >= min_audio_len_bytes:
+                    is_initial_transcription = False
+                
+                silence_duration_ms = (min_audio_len_bytes - len(buffer)) * 1000 // (sample_rate * sample_width)
+                padding = AudioSegment.silent(duration=silence_duration_ms, frame_rate=sample_rate)
+                audio_data = padding + AudioSegment(data=buffer, sample_width=sample_width, frame_rate=sample_rate, channels=channels)
+            else:
+                # Keep the buffer to a maximum of 15 seconds
+                if len(buffer) > window_size_bytes:
+                    buffer = buffer[-window_size_bytes:]
+                audio_data = AudioSegment(data=buffer, sample_width=sample_width, frame_rate=sample_rate, channels=channels)
+
+            # Transcribe
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmpfile:
+                temp_wav_file_path = tmpfile.name
+                audio_data.export(temp_wav_file_path, format="wav")
+            
+            start_time = time.time()
+            transcription_result = asr_model.transcribe([temp_wav_file_path])
+            end_time = time.time()
+            os.remove(temp_wav_file_path)
+
+            current_words = []
+            if transcription_result and len(transcription_result) > 0:
+                current_words = transcription_result[0].text.strip().split()
+            
+            if app.state.verbose:
+                print(f"[{time.strftime('%H:%M:%S')}] Audio length: {len(audio_data) / 1000:.2f}s, Time to transcribe: {end_time - start_time:.2f}s, Raw transcription: {' '.join(current_words[-20:])}")
+
+            transcription_history.append(current_words)
+
+            # Stability check
+            if len(transcription_history) == 3:
+                # Find the longest common subsequence between the last two transcriptions
+                s = difflib.SequenceMatcher(None, transcription_history[1], transcription_history[2])
+                match = s.find_longest_match(0, len(transcription_history[1]), 0, len(transcription_history[2]))
+
+                if match.size > 0:
+                    stable_words = transcription_history[2][match.b : match.b + match.size]
+                    
+                    # Now check if these stable words are also in the first transcription
+                    s2 = difflib.SequenceMatcher(None, transcription_history[0], stable_words)
+                    match2 = s2.find_longest_match(0, len(transcription_history[0]), 0, len(stable_words))
+
+                    if match2.size > 0:
+                        final_stable_words = stable_words[match2.b : match2.b + match2.size]
+                        
+                        # Find new words to send
+                        new_words = []
+                        if last_sent_word:
+                            try:
+                                # Search from the end of the list to find the last occurrence
+                                last_word_index = len(final_stable_words) - 1 - final_stable_words[::-1].index(last_sent_word)
+                                new_words = final_stable_words[last_word_index + 1:]
+                            except ValueError:
+                                # Last sent word not found, send all stable words
+                                new_words = final_stable_words
+                        else:
+                            new_words = final_stable_words
+                        
+                        if new_words:
+                            await websocket.send_text(" ".join(new_words))
+                            if new_words:
+                                last_sent_word = new_words[-1]
+
+    except WebSocketDisconnect:
+        print("Client disconnected from WebSocket V2.")
+    except Exception as e:
+        print(f"An error occurred in WebSocket V2: {e}")
+    finally:
+        if websocket.client_state.value != 3: # 3 is CLOSED state
+            await websocket.close()
+
 
 @app.post("/transcribe")
 async def transcribe_endpoint(audio_file: UploadFile = File(...)):
@@ -229,6 +444,8 @@ if __name__ == "__main__":
                         help="Host for the server (default: '0.0.0.0'). Only used with --server.")
     parser.add_argument("--port", type=int, default=5000,
                         help="Port for the server (default: 5000). Only used with --server.")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Enable verbose output for debugging.")
 
     args = parser.parse_args()
 
@@ -237,6 +454,7 @@ if __name__ == "__main__":
         print(f"Starting Parakeet ASR server with FastAPI/Uvicorn on http://{args.host}:{args.port}")
         # Store segment_length_sec in app.state for access in the endpoint
         app.state.segment_length_sec = args.segment_length
+        app.state.verbose = args.verbose
         import uvicorn
         uvicorn.run(app, host=args.host, port=args.port)
     else:

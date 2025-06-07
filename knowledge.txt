@@ -1,0 +1,30 @@
+# Project Goal and Current State
+
+## Goal:
+
+The primary goal of this project is to create a real-time, accurate, and responsive audio transcription system using the NVIDIA NeMo Parakeet TDT model. The system should be able to handle streaming audio from a microphone and provide a continuous stream of transcribed text to the client.
+
+## Current State:
+
+The project currently consists of a FastAPI server and a Python client.
+
+### Server (`parakeet.py`):
+
+*   **`/ws/transcribe` (Legacy):** This endpoint uses a 5-second sliding window and a simple diffing algorithm. It is not recommended for use due to its instability.
+*   **`/ws/transcribe_v2` (Recommended):** This is the current focus of development. It uses a 15-second sliding window with a 3-round stability check to ensure that only "stable" words are sent to the client. It also pads the initial audio to 5 seconds to provide a good "cold start".
+*   **`/transcribe`:** A standard HTTP endpoint for single-file transcription.
+
+### Client (`client.py`):
+
+*   Streams audio from the microphone to the `/ws/transcribe_v2` endpoint.
+*   Sends audio in 250ms chunks.
+*   Includes a `--verbose` flag for timestamped transcriptions.
+
+### Known Issues:
+
+*   The stability check in `/ws/transcribe_v2` is still not perfect and can sometimes send the entire transcription window instead of just the new words.
+*   The `last_sent_word_index` logic is prone to "index out of range" errors when the transcription changes significantly.
+
+### Next Steps:
+
+The immediate next step is to fix the stability check in `/ws/transcribe_v2` to correctly identify and send only the new, stable words.

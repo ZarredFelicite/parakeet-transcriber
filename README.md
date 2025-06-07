@@ -17,7 +17,7 @@ This project provides a tool for audio transcription using the NVIDIA NeMo Parak
 This project uses Nix for environment management, which simplifies the setup process by handling dependencies, including CUDA, which is required for the NeMo model.
 
 *   **Nix:** Ensure you have Nix installed on your system. Refer to the [official Nix installation guide](https://nixos.org/download/) for instructions.
-*   **FFmpeg:** While the Nix shell should provide necessary libraries, ensure FFmpeg is available in your environment if you encounter issues with audio processing.
+*   **FFmpeg:** While the Nix shell should provide necessary libraries, ensure FFmpeg is available in your environment if you encounter issues with audio processing. The script now includes a check to verify that `ffmpeg` is in your system's PATH when the model is loaded.
 
 ## Installation
 
@@ -84,6 +84,48 @@ The server will return a JSON response containing the transcription:
 ```
 
 If an error occurs, the response will contain an "error" field.
+
+### Client Script for Streaming
+
+A client script, `client.py`, is provided to demonstrate how to stream audio from a microphone to the WebSocket endpoint.
+
+**Prerequisites:**
+
+*   You will need to have `portaudio` installed on your system for `pyaudio` to work.
+    *   On Debian/Ubuntu: `sudo apt-get install portaudio19-dev`
+    *   On macOS (using Homebrew): `brew install portaudio`
+
+**Usage:**
+
+1.  Make sure the server is running (`python parakeet.py --server`).
+2.  Run the client script:
+    ```bash
+    python client.py
+    ```
+    The script will start recording from your default microphone and stream the audio to the server. It will automatically stop after 5 seconds of silence.
+
+### WebSocket Streaming Transcription V2 (Recommended)
+
+A new WebSocket endpoint, `/ws/transcribe_v2`, is available for more robust and accurate real-time transcription.
+
+**How it Works:**
+
+1.  **Initial Padding:** The endpoint waits for 5 seconds of audio, padding with silence if necessary, to get a strong initial transcription.
+2.  **Ever-Increasing Buffer:** After the initial transcription, it transcribes the entire audio buffer at regular intervals.
+3.  **Stability Check:** A word is only sent to the client after it has appeared in the same position in the transcription for 3 consecutive rounds. This ensures that only "stable" words are sent, which significantly improves the quality of the real-time transcription.
+
+To use this new endpoint, change the `WEBSOCKET_URI` in `client.py` to `ws://localhost:5000/ws/transcribe_v2`.
+
+### WebSocket Streaming Transcription (Legacy)
+
+The server also provides a WebSocket endpoint at `/ws/transcribe` for real-time streaming transcription. This is ideal for applications that need to process audio as it is being recorded or streamed.
+
+**How it Works:**
+
+1.  **Connection:** The client establishes a WebSocket connection to the server.
+2.  **Audio Streaming:** The client sends audio chunks (16-bit, 16kHz, mono) to the server.
+3.  **Sliding Window:** The server uses a 5-second sliding window to continuously process the incoming audio. The window slides by 1 second at a time.
+4.  **Real-time Transcription:** The server transcribes the audio in the window and sends back only the newly transcribed words to the client. This minimizes data transfer and provides a smooth real-time experience.
 
 **Note on `flake.nix` `start` script:** The `flake.nix` includes an application definition (`apps.parakeet`) that runs a `start` script. This script is configured to run the `parakeet.py` script in server mode on port 5001.
 
