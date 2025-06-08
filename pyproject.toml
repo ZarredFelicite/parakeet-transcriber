@@ -16,4 +16,5 @@ dependencies = [
     "pyaudio",
     "websockets",
     "webrtcvad",
+    "evdev-binary",
 ]

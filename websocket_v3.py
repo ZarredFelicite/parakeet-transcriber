@@ -89,10 +89,9 @@ def words_match_flexible(word1, word2):
     return False
 
 
-def sequence_matches_flexible(target_seq, words, start_pos):
-    """Check if target sequence matches at start_pos with flexible number matching and currency conversion"""
-    # Handle currency sequences like "three dollars" -> "$3"
-    converted_words = []
+def convert_word_sequence(words):
+    """Convert a word sequence, handling currency phrases like 'three dollars' -> '$3'"""
+    converted = []
     i = 0
     while i < len(words):
         if i < len(words) - 1:
@@ -102,27 +101,39 @@ def sequence_matches_flexible(target_seq, words, start_pos):
             # Check for currency sequence
             if current.isdigit() and next_word in ['dollar', 'dollars', 'pound', 'pounds', 'euro', 'euros']:
                 if next_word in ['dollar', 'dollars']:
-                    converted_words.append(f"${current}")
+                    converted.append(f"${current}")
                 elif next_word in ['pound', 'pounds']:
-                    converted_words.append(f"£{current}")
+                    converted.append(f"£{current}")
                 elif next_word in ['euro', 'euros']:
-                    converted_words.append(f"€{current}")
-                i += 2  # Skip the currency word
+                    converted.append(f"€{current}")
+                i += 2  # Skip both words
                 continue
         
-        converted_words.append(normalize_word_for_matching(words[i]))
+        converted.append(normalize_word_for_matching(words[i]))
         i += 1
     
-    # Now check the sequence against converted words
-    if start_pos + len(target_seq) > len(converted_words):
+    return converted
+
+
+def sequence_matches_flexible(target_seq, words, start_pos):
+    """Check if target sequence matches at start_pos with flexible number matching"""
+    # Convert both target and transcription to normalized form
+    converted_target = convert_word_sequence(target_seq)
+    converted_words = convert_word_sequence(words)
+    
+    # Adjust start_pos if conversion changed the word array length
+    if start_pos >= len(converted_words):
         return False
     
-    for i, target_word in enumerate(target_seq):
+    if start_pos + len(converted_target) > len(converted_words):
+        return False
+    
+    # Simple exact matching after conversion
+    for i, target_word in enumerate(converted_target):
         current_word = converted_words[start_pos + i]
-        target_norm = normalize_word_for_matching(target_word)
         
-        # Also try direct flexible matching for number variations
-        if current_word != target_norm and not words_match_flexible(target_word, current_word):
+        # Also try flexible matching for number variations like $3 vs $3.6
+        if current_word != target_word and not words_match_flexible(target_word, current_word):
             return False
     
     return True
@@ -151,7 +162,7 @@ class WordState:
         return (self.word_clean, self.prev_word, self.next_word)
     
     def _update_state(self):
-        if self.frequency >= 3:
+        if self.frequency >= 4:
             self.state = "confirmed"
         elif self.frequency >= 2:
             self.state = "potential"
@@ -171,10 +182,11 @@ class WordState:
 
 
 class TranscriptionTracker:
-    def __init__(self):
+    def __init__(self, min_confirmed_words=4):
         self.word_states = {}  # context_key -> WordState
         self.confirmed_words = []  # Simple list of confirmed words (no context)
         self.sent_words_count = 0
+        self.min_confirmed_words = min_confirmed_words  # Stop removing words when we reach this many
         
     def process_transcription(self, words):
         new_words_to_send = []
@@ -188,9 +200,9 @@ class TranscriptionTracker:
             context_key = word_state.get_context_key()
             
             if context_key in self.word_states:
-                # Only increment if not already confirmed (to stop counting at 3)
+                # Only increment if not already confirmed (to stop counting at 4)
                 existing_state = self.word_states[context_key]
-                if existing_state.frequency < 3:
+                if existing_state.frequency < 4:
                     existing_state.increment_frequency(word)
                 else:
                     # Update latest form but don't increment frequency
@@ -205,60 +217,16 @@ class TranscriptionTracker:
         # Search only in the last 20 words to avoid duplicate sequence matches
         search_start = max(0, len(words_clean) - 20)
         
-        # Try cascading fallback: 4 words -> 3 words -> 2 words -> 1 word
-        if len(self.confirmed_words) >= 4:
-            # Try last four words first
-            last_four = [strip_punctuation(w) for w in self.confirmed_words[-4:]]
-            # Debug logging
-            print(f"[DEBUG] Looking for last 4: {last_four} in last 20 words: {words_clean[search_start:]}")
-            for i in range(search_start, len(words_clean) - 3):
-                if sequence_matches_flexible(last_four, words, i):
-                    start_index = i + 4
-                    print(f"[DEBUG] Found 4-word match at position {i}, start_index = {start_index}")
-                    break
+        # Try cascading search: 4 -> 3 -> 2 -> 1 words
+        for n in [4, 3, 2, 1]:
+            start_index = self._try_n_word_match(n, words, words_clean, search_start)
+            if start_index > 0:
+                break
         
-        # If no match with 4, try last three
-        if start_index == 0 and len(self.confirmed_words) >= 3:
-            last_three = [strip_punctuation(w) for w in self.confirmed_words[-3:]]
-            # Debug logging
-            print(f"[DEBUG] Looking for last 3: {last_three} in last 20 words: {words_clean[search_start:]}")
-            for i in range(search_start, len(words_clean) - 2):
-                if sequence_matches_flexible(last_three, words, i):
-                    start_index = i + 3
-                    print(f"[DEBUG] Found 3-word match at position {i}, start_index = {start_index}")
-                    break
+        # If no match found, try fallback with word removal
+        if start_index == 0 and len(self.confirmed_words) > 0:
+            start_index = self._try_fallback_matching(words, words_clean, search_start)
             
-            # If no match with 3, try last two
-            if start_index == 0:
-                last_two = [strip_punctuation(w) for w in self.confirmed_words[-2:]]
-                print(f"[DEBUG] Looking for last 2: {last_two} in last 20 words: {words_clean[search_start:]}")
-                for i in range(search_start, len(words_clean) - 1):
-                    if sequence_matches_flexible(last_two, words, i):
-                        start_index = i + 2
-                        print(f"[DEBUG] Found 2-word match at position {i}, start_index = {start_index}")
-                        break
-        
-        # If still no match, or we have 1-2 confirmed words, try last two/one
-        if start_index == 0 and len(self.confirmed_words) >= 2:
-            last_two = [strip_punctuation(w) for w in self.confirmed_words[-2:]]
-            print(f"[DEBUG] Looking for last 2 (fallback): {last_two} in last 20 words: {words_clean[search_start:]}")
-            for i in range(search_start, len(words_clean) - 1):
-                if sequence_matches_flexible(last_two, words, i):
-                    start_index = i + 2
-                    print(f"[DEBUG] Found 2-word fallback match at position {i}, start_index = {start_index}")
-                    break
-        
-        # Final fallback: try just the last word
-        if start_index == 0 and len(self.confirmed_words) >= 1:
-            last_word = strip_punctuation(self.confirmed_words[-1])
-            print(f"[DEBUG] Looking for last 1: [{last_word}] in last 20 words: {words_clean[search_start:]}")
-            for i in range(search_start, len(words_clean)):
-                if words_match_flexible(last_word, words[i]):
-                    start_index = i + 1
-                    print(f"[DEBUG] Found 1-word match at position {i}, start_index = {start_index}")
-                    break
-        
-        # If still no match found, throw exception to stop program
         if start_index == 0 and len(self.confirmed_words) > 0:
             raise Exception(f"Sequence matching failed completely! Confirmed words: {self.confirmed_words[-5:]} | Current transcription: {words[:20]}")
         
@@ -289,6 +257,57 @@ class TranscriptionTracker:
         
         return new_words_to_send
     
+    def _try_n_word_match(self, n, words, words_clean, search_start, fallback=False):
+        """Try to match the last n words from confirmed sequence"""
+        if len(self.confirmed_words) < n:
+            return 0
+            
+        last_n = [strip_punctuation(w) for w in self.confirmed_words[-n:]]
+        prefix = "[DEBUG FALLBACK]" if fallback else "[DEBUG]"
+        print(f"{prefix} Looking for last {n}: {last_n} in last 20 words: {words_clean[search_start:]}")
+        
+        search_limit = len(words_clean) - n + 1
+        for i in range(search_start, search_limit):
+            if n == 1:
+                # Special case for single word matching
+                if words_match_flexible(last_n[0], words[i]):
+                    print(f"{prefix} Found {n}-word match at position {i}, start_index = {i + n}")
+                    return i + n
+            else:
+                # Multi-word sequence matching
+                if sequence_matches_flexible(last_n, words, i):
+                    print(f"{prefix} Found {n}-word match at position {i}, start_index = {i + n}")
+                    return i + n
+        return 0
+    
+    def _try_fallback_matching(self, words, words_clean, search_start):
+        """Try matching by progressively removing words from the end of confirmed sequence"""
+        removed_words = []
+        min_words = getattr(self, 'min_confirmed_words', 4)
+        
+        # Keep trying while we have more words than minimum
+        while len(self.confirmed_words) >= min_words:
+            print(f"[DEBUG FALLBACK] Removing last confirmed word: '{self.confirmed_words[-1]}'")
+            
+            # Remove the last confirmed word
+            removed_words.append(self.confirmed_words.pop())
+            self.sent_words_count -= 1
+            
+            # Try cascade: 4->3->2->1 words with remaining confirmed words
+            for n in [4, 3, 2, 1]:
+                start_index = self._try_n_word_match(n, words, words_clean, search_start, fallback=True)
+                if start_index > 0:
+                    print(f"[DEBUG FALLBACK] Found match after removing {len(removed_words)} word(s)")
+                    return start_index
+        
+        # No match found, restore all removed words
+        print(f"[DEBUG FALLBACK] No match found, restoring {len(removed_words)} removed word(s)")
+        while removed_words:
+            self.confirmed_words.append(removed_words.pop())
+            self.sent_words_count += 1
+        
+        return 0
+        
     def get_debug_info(self):
         confirmed_words = []
         potential_words = []

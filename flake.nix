@@ -25,6 +25,9 @@
           ffmpeg
           libgcc
           portaudio
+          linuxHeaders
+          xorg.libX11
+          xorg.libXtst
         ];
 
         devTools = with pkgs; [
@@ -48,7 +51,7 @@
 
         env = {
           LD_LIBRARY_PATH =
-            "${libPath}:/run/opengl-driver/lib:/run/opengl-driver-32/lib";
+            "${libPath}:/run/opengl-driver/lib:/run/opengl-driver-32/lib:${pkgs.linuxHeaders}/include";
           XLA_FLAGS = "--xla_gpu_cuda_data_dir=${pkgs.cudaPackages.cudatoolkit}";
           CUDA_PATH = "${pkgs.cudaPackages.cudatoolkit}";
         };
