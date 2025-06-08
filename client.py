@@ -67,6 +67,15 @@ class AudioClient:
         self.type_mode = type_mode
         self.type_delay = type_delay
 
+    def _print_with_delay(self, text):
+        """Print text character by character with delays: 10ms for chars, 50ms for spaces"""
+        for char in text:
+            print(char, end="", flush=True, file=sys.stdout)
+            if char == " ":
+                time.sleep(0.05)  # 50ms delay for spaces
+            else:
+                time.sleep(0.01)  # 10ms delay for characters
+
     def _record_thread(self):
         stream = self.p.open(format=FORMAT,
                              channels=CHANNELS,
@@ -118,10 +127,10 @@ class AudioClient:
                 if self.verbose:
                     print(f"[{time.strftime('%H:%M:%S')}] Transcription: {message}", end=" ", flush=True, file=sys.stderr)
                     if not self.type_mode:  # Only print to stdout if not typing
-                        print(message, end=" ", flush=True, file=sys.stdout)
+                        self._print_with_delay(message + " ")
                 else:
                     if not self.type_mode:  # Only print to stdout if not typing
-                        print(message, end=" ", flush=True, file=sys.stdout)
+                        self._print_with_delay(message + " ")
                         
         except websockets.exceptions.ConnectionClosed:
             print("\nConnection to server closed.", file=sys.stderr)
