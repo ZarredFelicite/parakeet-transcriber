@@ -8,19 +8,22 @@ import argparse
 import queue
 
 # --- Configuration ---
-WEBSOCKET_URI = "ws://localhost:5000/ws/transcribe_v2"
-CHUNK_DURATION_MS = 30  # VAD supports 10, 20, or 30 ms chunks
+WEBSOCKET_URI_BASE = "ws://localhost:5000/ws/transcribe_v3"
 RATE = 16000  # Sample rate (16kHz)
-CHUNK_SIZE = int(RATE * CHUNK_DURATION_MS / 1000)  # 30ms chunk size in bytes
+VAD_CHUNK_DURATION_MS = 30 # VAD supports 10, 20, or 30 ms chunks
+VAD_CHUNK_SIZE = int(RATE * VAD_CHUNK_DURATION_MS / 1000)
 FORMAT = pyaudio.paInt16  # Audio format (16-bit)
 CHANNELS = 1  # Mono audio
 VAD_AGGRESSIVENESS = 3  # VAD aggressiveness (0-3)
 SILENCE_TIMEOUT = 5  # Seconds of silence to wait before stopping
 
 class AudioClient:
-    def __init__(self, verbose=False):
+    def __init__(self, send_interval_ms=250, verbose=False):
         self.p = pyaudio.PyAudio()
         self.vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
+        self.send_interval_ms = send_interval_ms
+        self.send_interval_bytes = int(RATE * CHANNELS * (self.send_interval_ms / 1000.0))
+        self.websocket_uri = f"{WEBSOCKET_URI_BASE}?chunk_duration_ms={self.send_interval_ms}"
         self.websocket = None
         self.audio_queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -31,30 +34,30 @@ class AudioClient:
                              channels=CHANNELS,
                              rate=RATE,
                              input=True,
-                             frames_per_buffer=CHUNK_SIZE)
+                             frames_per_buffer=VAD_CHUNK_SIZE)
         
         silence_start_time = None
         buffer = bytearray()
-        two_fifty_ms_bytes = RATE * CHANNELS // 2 # 0.25 second of 16-bit audio
 
         while not self.stop_event.is_set():
-            data = stream.read(CHUNK_SIZE)
-            buffer.extend(data)
-
+            data = stream.read(VAD_CHUNK_SIZE)
             is_speech = self.vad.is_speech(data, RATE)
 
             if is_speech:
                 silence_start_time = None
+                buffer.extend(data)
             else:
                 if silence_start_time is None:
                     silence_start_time = time.time()
                 elif time.time() - silence_start_time > SILENCE_TIMEOUT:
                     print("Silence detected. Stopping recording.")
                     self.stop_event.set()
+                # Still buffer non-speech to avoid cutting words off
+                buffer.extend(data)
 
-            if len(buffer) >= two_fifty_ms_bytes:
-                self.audio_queue.put(buffer)
-                buffer = bytearray()
+            while len(buffer) >= self.send_interval_bytes:
+                self.audio_queue.put(buffer[:self.send_interval_bytes])
+                buffer = buffer[self.send_interval_bytes:]
 
         stream.stop_stream()
         stream.close()
@@ -76,7 +79,7 @@ class AudioClient:
         print("Recording started...")
 
         try:
-            self.websocket = await websockets.connect(WEBSOCKET_URI)
+            self.websocket = await websockets.connect(self.websocket_uri)
             
             # Start the receiver task
             receiver_task = asyncio.create_task(self.receiver())
@@ -107,8 +110,10 @@ class AudioClient:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Client for streaming audio to the Parakeet ASR server.")
+    parser.add_argument("--send_interval_ms", type=int, default=250,
+                        help="Duration of each audio chunk sent to the server in milliseconds.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose printing with timestamps.")
     args = parser.parse_args()
 
-    client = AudioClient(verbose=args.verbose)
+    client = AudioClient(send_interval_ms=args.send_interval_ms, verbose=args.verbose)
     asyncio.run(client.record_and_stream())

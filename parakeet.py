@@ -13,9 +13,36 @@ import difflib
 import time
 from collections import deque
 import asyncio
+from websocket_v3 import websocket_transcribe_v3_endpoint
 
 # Global variable for the ASR model
 ASR_MODEL = None
+
+class WordState:
+    def __init__(self, word, state="unconfirmed", stable_count=0):
+        self.word = word
+        self.state = state # "unconfirmed", "potential", "confirmed"
+        self.stable_count = stable_count # How many consecutive times it appeared after the anchor
+
+def find_longest_common_substring(list_of_lists):
+    """Finds the longest common sequence of items anywhere in several lists."""
+    if not list_of_lists:
+        return []
+
+    shortest_list = min(list_of_lists, key=len)
+    longest_common_substring = []
+
+    for i in range(len(shortest_list)):
+        for j in range(i, len(shortest_list)):
+            substring = shortest_list[i:j+1]
+            is_common = all(
+                difflib.SequenceMatcher(None, substring, other_list).find_longest_match(0, len(substring), 0, len(other_list)).size == len(substring)
+                for other_list in list_of_lists
+            )
+            if is_common and len(substring) > len(longest_common_substring):
+                longest_common_substring = substring
+
+    return longest_common_substring
 
 def check_ffmpeg_in_path():
     """Checks if ffmpeg is available in the system's PATH."""
@@ -302,6 +329,14 @@ async def websocket_transcribe_v2_endpoint(websocket: WebSocket):
     await websocket.accept()
     asr_model = load_model()
 
+    # Get chunk duration from query params, with a default
+    try:
+        chunk_duration_ms = int(websocket.query_params.get("chunk_duration_ms", 250))
+    except (TypeError, ValueError):
+        chunk_duration_ms = 250
+    
+    receive_timeout = (chunk_duration_ms / 1000.0) * 2
+
     # Constants
     sample_rate = 16000
     sample_width = 2
@@ -312,14 +347,15 @@ async def websocket_transcribe_v2_endpoint(websocket: WebSocket):
 
     buffer = bytearray()
     transcription_history = deque(maxlen=3)
-    last_sent_word = None
+    confirmed_words = []
+    potential_words_history = deque(maxlen=3)
+    anchor_misses = 0
     is_initial_transcription = True
 
     try:
-        # Main transcription loop
         while True:
             try:
-                data = await asyncio.wait_for(websocket.receive_bytes(), timeout=0.25)
+                data = await asyncio.wait_for(websocket.receive_bytes(), timeout=receive_timeout)
                 buffer.extend(data)
             except asyncio.TimeoutError:
                 pass
@@ -332,12 +368,10 @@ async def websocket_transcribe_v2_endpoint(websocket: WebSocket):
                 padding = AudioSegment.silent(duration=silence_duration_ms, frame_rate=sample_rate)
                 audio_data = padding + AudioSegment(data=buffer, sample_width=sample_width, frame_rate=sample_rate, channels=channels)
             else:
-                # Keep the buffer to a maximum of 15 seconds
                 if len(buffer) > window_size_bytes:
                     buffer = buffer[-window_size_bytes:]
                 audio_data = AudioSegment(data=buffer, sample_width=sample_width, frame_rate=sample_rate, channels=channels)
 
-            # Transcribe
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmpfile:
                 temp_wav_file_path = tmpfile.name
                 audio_data.export(temp_wav_file_path, format="wav")
@@ -347,56 +381,97 @@ async def websocket_transcribe_v2_endpoint(websocket: WebSocket):
             end_time = time.time()
             os.remove(temp_wav_file_path)
 
-            current_words = []
-            if transcription_result and len(transcription_result) > 0:
-                current_words = transcription_result[0].text.strip().split()
+            current_words = transcription_result[0].text.strip().split() if transcription_result and transcription_result[0].text else []
             
             if app.state.verbose:
-                print(f"[{time.strftime('%H:%M:%S')}] Audio length: {len(audio_data) / 1000:.2f}s, Time to transcribe: {end_time - start_time:.2f}s, Raw transcription: {' '.join(current_words[-20:])}")
+                print(f"[{time.strftime('%H:%M:%S')}] Audio: {len(audio_data)/1000:.2f}s, Transcribe time: {end_time-start_time:.2f}s, Raw: {' '.join(current_words)}")
 
             transcription_history.append(current_words)
 
-            # Stability check
-            if len(transcription_history) == 3:
-                # Find the longest common subsequence between the last two transcriptions
-                s = difflib.SequenceMatcher(None, transcription_history[1], transcription_history[2])
-                match = s.find_longest_match(0, len(transcription_history[1]), 0, len(transcription_history[2]))
+            if not confirmed_words:
+                # Initial stage
+                if len(transcription_history) == 3:
+                    stable_string = find_longest_common_substring(list(transcription_history))
+                    if stable_string:
+                        confirmed_words.extend(stable_string)
+                        await websocket.send_text(" ".join(confirmed_words))
+                        if app.state.verbose:
+                            print(f"Confirmed initial words: {' '.join(confirmed_words)}")
+            else:
+                # Anchor stage
+                anchor_size = min(len(confirmed_words), 2)
+                anchor = confirmed_words[-anchor_size:]
+                if app.state.verbose:
+                    print(f"Using anchor: {' '.join(anchor)}")
+                anchor_found = False
+                try:
+                    anchor_index = current_words.index(anchor[0], 0)
+                    while anchor_index != -1:
+                        if current_words[anchor_index:anchor_index+len(anchor)] == anchor:
+                            potential_new_words = current_words[anchor_index + len(anchor):]
+                            if app.state.verbose:
+                                print(f"Found anchor. Potential new words: {' '.join(potential_new_words)}")
+                            potential_words_history.append(potential_new_words)
+                            anchor_found = True
+                            break
+                        anchor_index = current_words.index(anchor[0], anchor_index + 1)
+                except ValueError:
+                    pass # Anchor not found
 
-                if match.size > 0:
-                    stable_words = transcription_history[2][match.b : match.b + match.size]
-                    
-                    # Now check if these stable words are also in the first transcription
-                    s2 = difflib.SequenceMatcher(None, transcription_history[0], stable_words)
-                    match2 = s2.find_longest_match(0, len(transcription_history[0]), 0, len(stable_words))
+                if anchor_found:
+                    anchor_misses = 0
+                else:
+                    anchor_misses += 1
+                    if app.state.verbose:
+                        print(f"Anchor not found. Misses: {anchor_misses}")
 
-                    if match2.size > 0:
-                        final_stable_words = stable_words[match2.b : match2.b + match2.size]
-                        
-                        # Find new words to send
-                        new_words = []
-                        if last_sent_word:
-                            try:
-                                # Search from the end of the list to find the last occurrence
-                                last_word_index = len(final_stable_words) - 1 - final_stable_words[::-1].index(last_sent_word)
-                                new_words = final_stable_words[last_word_index + 1:]
-                            except ValueError:
-                                # Last sent word not found, send all stable words
-                                new_words = final_stable_words
-                        else:
-                            new_words = final_stable_words
-                        
-                        if new_words:
-                            await websocket.send_text(" ".join(new_words))
-                            if new_words:
-                                last_sent_word = new_words[-1]
+                if anchor_misses >= 3:
+                    if app.state.verbose:
+                        print("Three consecutive anchor misses. Falling back to substring matching.")
+                    potential_words_history.clear()
+                    # Fallback to substring matching
+                    if len(transcription_history) == 3:
+                        stable_string = find_longest_common_substring(list(transcription_history))
+                        if app.state.verbose:
+                            print(f"Fallback stable string: {' '.join(stable_string)}")
+                        if stable_string and stable_string != confirmed_words:
+                            # Check for continuation
+                            if len(stable_string) > len(confirmed_words) and stable_string[:len(confirmed_words)] == confirmed_words:
+                                new_words = stable_string[len(confirmed_words):]
+                                if app.state.verbose:
+                                    print(f"Fallback continuation. New words: {' '.join(new_words)}")
+                                confirmed_words.extend(new_words)
+                                await websocket.send_text(" ".join(new_words))
+                            else:
+                                # Correction
+                                if app.state.verbose:
+                                    print(f"Fallback correction. New transcription: {' '.join(stable_string)}")
+                                confirmed_words = stable_string
+                                await websocket.send_text(" ".join(confirmed_words))
+                    anchor_misses = 0 # Reset after fallback
+                elif len(potential_words_history) == 3:
+                    stable_new_words = find_longest_common_substring(list(potential_words_history))
+                    if app.state.verbose:
+                        print(f"Checking for stable new words: {' '.join(stable_new_words)}")
+                    if stable_new_words:
+                        if app.state.verbose:
+                            print(f"Confirmed new words: {' '.join(stable_new_words)}")
+                        await websocket.send_text(" ".join(stable_new_words))
+                        confirmed_words.extend(stable_new_words)
+                        potential_words_history.clear()
 
     except WebSocketDisconnect:
         print("Client disconnected from WebSocket V2.")
     except Exception as e:
         print(f"An error occurred in WebSocket V2: {e}")
     finally:
-        if websocket.client_state.value != 3: # 3 is CLOSED state
+        if websocket.client_state.value != 3:
             await websocket.close()
+
+@app.websocket("/ws/transcribe_v3")
+async def websocket_transcribe_v3_endpoint_wrapper(websocket: WebSocket):
+    asr_model = load_model()
+    await websocket_transcribe_v3_endpoint(websocket, asr_model, verbose=app.state.verbose if hasattr(app.state, 'verbose') else False)
 
 
 @app.post("/transcribe")
