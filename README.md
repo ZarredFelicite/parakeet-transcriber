@@ -1,36 +1,44 @@
 # Parakeet Audio Transcription
 
-This project provides a tool for audio transcription using the NVIDIA NeMo Parakeet TDT (Text-Dependent Transcription) model. It can be used via a command-line interface or as a FastAPI web server.
+This project provides a tool for audio transcription using the NVIDIA NeMo Parakeet TDT (Text-Dependent Transcription) model. It can be used via a command-line interface or as a FastAPI web server with a WebSocket endpoint for real-time streaming.
 
 ## Features
 
-*   Audio transcription using the powerful Parakeet TDT model.
-*   Supports various audio (WAV, MP3) and video (MP4, MKV, AVI, MOV, WMV, FLV, WebM) formats by extracting the audio stream.
-*   Automatic conversion to mono and resampling to 16kHz for compatibility with the ASR model.
-*   Splits long audio files into segments for efficient processing.
-*   Provides both a Command-Line Interface (CLI) and a FastAPI web server mode.
-*   Basic error handling for file operations.
-*   Cleans up temporary audio segment files after transcription.
+* Audio transcription using the powerful Parakeet TDT model.
+* Supports various audio (WAV, MP3) and video (MP4, MKV, AVI, MOV, WMV, FLV, WebM) formats by extracting the audio stream.
+* Automatic conversion to mono and resampling to 16kHz for compatibility with the ASR model.
+* Splits long audio files into segments for efficient processing (CLI and POST endpoint).
+* Provides both a Command-Line Interface (CLI) and a FastAPI web server mode.
+* FastAPI server includes:
+  * A POST endpoint (`/transcribe`) for batch transcription of uploaded files.
+  * A WebSocket endpoint (`/ws/transcribe`) for real-time streaming transcription.
+* Real-time transcription features advanced word stabilization and context-aware punctuation.
 
-## Prerequisites
+## Getting Started
 
-This project uses Nix for environment management, which simplifies the setup process by handling dependencies, including CUDA, which is required for the NeMo model.
+### Prerequisites
 
-*   **Nix:** Ensure you have Nix installed on your system. Refer to the [official Nix installation guide](https://nixos.org/download/) for instructions.
-*   **FFmpeg:** While the Nix shell should provide necessary libraries, ensure FFmpeg is available in your environment if you encounter issues with audio processing. The script now includes a check to verify that `ffmpeg` is in your system's PATH when the model is loaded.
+This project uses Nix for environment management. This simplifies the setup process by handling all dependencies, including CUDA, which is required for the NeMo model.
 
-## Installation
+* **Nix:** Ensure you have Nix installed on your system. Refer to the [official Nix installation guide](https://nixos.org/download/) for instructions.
+* **FFmpeg:** The Nix shell provides the necessary libraries, but if you encounter audio processing issues, ensure `ffmpeg` is available in your environment. The script includes a check to verify that `ffmpeg` is in your system's PATH.
 
-1.  Clone the repository:
-    ```bash
-    git clone <repository_url>
-    cd <repository_directory>
-    ```
-2.  Enter the Nix development environment:
-    ```bash
-    nix develop
-    ```
-    This command will set up the required dependencies, including CUDA and Python with the necessary libraries. The `shellHook` in `flake.nix` will automatically create and activate a Python virtual environment using `uv` and install the project's dependencies from `pyproject.toml`.
+### Installation & Setup
+
+1. Clone the repository:
+
+   ```bash
+   git clone <repository_url>
+   cd <repository_directory>
+   ```
+
+2. Enter the Nix development environment:
+
+   ```bash
+   nix develop
+   ```
+
+   This command sets up all required dependencies, including CUDA and Python. A Python virtual environment will be automatically created and activated using `uv`, and the project's dependencies from `pyproject.toml` will be installed.
 
 ## Usage
 
@@ -46,33 +54,46 @@ python parakeet.py [input_file_path]
 
 Replace `[input_file_path]` with the path to your audio (WAV, MP3) or video (MP4, MKV, AVI, MOV, WMV, FLV) file.
 
-You can also specify the segment length for processing using the `--segment_length` argument (default is 60 seconds):
+You can also specify the segment length for processing using the `--segment_length` argument (default is 60 seconds), and enable verbose logging with `--verbose`:
 
 ```bash
-python parakeet.py my_audio.mp3 --segment_length 30
+python parakeet.py my_audio.mp3 --segment_length 30 --verbose
 ```
 
 ### Server Mode
 
-To run the transcription as a FastAPI web server:
+To run the transcription as a FastAPI web server, you can use the `start` script defined in `flake.nix`, which is the recommended method:
+
+```bash
+nix run .#parakeet
+```
+
+This will start the server on `http://0.0.0.0:5001` by default.
+
+Alternatively, you can run the script directly:
 
 ```bash
 python parakeet.py --server
 ```
 
-By default, the server will run on `http://0.0.0.0:5000`. You can customize the host and port using the `--host` and `--port` arguments:
+By default, the server will run on `http://0.0.0.0:5000`. You can customize the host, port, segment length for POST requests, and verbosity:
 
 ```bash
-python parakeet.py --server --host 127.0.0.1 --port 8000
+python parakeet.py --server --host 127.0.0.1 --port 8000 --segment_length 45 --verbose
 ```
 
-The server exposes a `/transcribe` endpoint that accepts POST requests with an audio or video file in the `audio_file` form data field.
+The server exposes two main endpoints:
+
+#### 1. POST `/transcribe`
+
+Accepts POST requests with an audio or video file in the `audio_file` form data field for batch transcription.
 
 Example using `curl`:
 
 ```bash
 curl -X POST -F "audio_file=@/path/to/your/input_file.mp4" http://127.0.0.1:5000/transcribe
 ```
+
 Replace `.mp4` with the actual file extension of your audio or video file.
 
 The server will return a JSON response containing the transcription:
@@ -85,64 +106,60 @@ The server will return a JSON response containing the transcription:
 
 If an error occurs, the response will contain an "error" field.
 
-### Client Script for Streaming
+#### 2. WebSocket `/ws/transcribe`
 
-A client script, `client.py`, is provided to demonstrate how to stream audio from a microphone to the WebSocket endpoint.
+Provides a WebSocket endpoint for real-time streaming transcription. This is ideal for applications that need to process audio as it is being recorded or streamed.
+
+**How it Works:**
+
+The client establishes a WebSocket connection to `ws://<host>:<port>/ws/transcribe`. It can pass `chunk_duration_ms` and `verbose` as query parameters. The client then streams audio chunks (16-bit, 16kHz, mono PCM). The server transcribes the audio, applying word stabilization and contextual punctuation, and sends back confirmed words in real-time.
+
+### Client Script for Streaming (`client.py`)
+
+A client script, `client.py`, is provided to demonstrate how to stream audio from a microphone to the WebSocket endpoint (`/ws/transcribe`).
 
 **Prerequisites:**
 
-*   You will need to have `portaudio` installed on your system for `pyaudio` to work.
-    *   On Debian/Ubuntu: `sudo apt-get install portaudio19-dev`
-    *   On macOS (using Homebrew): `brew install portaudio`
+The Nix environment provides all necessary dependencies. However, if you run the client outside of the managed environment, you may need to install `portaudio`:
+
+* On Debian/Ubuntu: `sudo apt-get install portaudio19-dev`
+* On macOS (using Homebrew): `brew install portaudio`
 
 **Usage:**
 
-1.  Make sure the server is running (`python parakeet.py --server`).
-2.  Run the client script:
-    ```bash
-    python client.py
-    ```
-    The script will start recording from your default microphone and stream the audio to the server. It will automatically stop after 5 seconds of silence.
+1. Make sure the server is running (`nix run .#parakeet` or `python parakeet.py --server`).
 
-### WebSocket Streaming Transcription V2 (Recommended)
+2. Run the client script:
 
-A new WebSocket endpoint, `/ws/transcribe_v2`, is available for more robust and accurate real-time transcription.
+   ```bash
+   python client.py
+   ```
 
-**How it Works:**
+   The script will start recording from your default microphone and stream the audio to the server. It will print the transcribed words as they are received. The client automatically stops after 5 seconds of silence. The WebSocket URI is configurable and defaults to `ws://localhost:5000/ws/transcribe?chunk_duration_ms=250`.
 
-1.  **Initial Padding:** The endpoint waits for 5 seconds of audio, padding with silence if necessary, to get a strong initial transcription.
-2.  **Ever-Increasing Buffer:** After the initial transcription, it transcribes the entire audio buffer at regular intervals.
-3.  **Stability Check:** A word is only sent to the client after it has appeared in the same position in the transcription for 3 consecutive rounds. This ensures that only "stable" words are sent, which significantly improves the quality of the real-time transcription.
+## Project Structure
 
-To use this new endpoint, change the `WEBSOCKET_URI` in `client.py` to `ws://localhost:5000/ws/transcribe_v2`.
-
-### WebSocket Streaming Transcription (Legacy)
-
-The server also provides a WebSocket endpoint at `/ws/transcribe` for real-time streaming transcription. This is ideal for applications that need to process audio as it is being recorded or streamed.
-
-**How it Works:**
-
-1.  **Connection:** The client establishes a WebSocket connection to the server.
-2.  **Audio Streaming:** The client sends audio chunks (16-bit, 16kHz, mono) to the server.
-3.  **Sliding Window:** The server uses a 5-second sliding window to continuously process the incoming audio. The window slides by 1 second at a time.
-4.  **Real-time Transcription:** The server transcribes the audio in the window and sends back only the newly transcribed words to the client. This minimizes data transfer and provides a smooth real-time experience.
-
-**Note on `flake.nix` `start` script:** The `flake.nix` includes an application definition (`apps.parakeet`) that runs a `start` script. This script is configured to run the `parakeet.py` script in server mode on port 5001.
+* `parakeet.py`: The main script containing the CLI and FastAPI server logic.
+* `client.py`: An example client for the real-time streaming WebSocket endpoint.
+* `flake.nix`: The Nix flake for managing the development environment and dependencies.
+* `pyproject.toml`: Defines the Python project metadata and dependencies.
+* `README.md`: You are here!
 
 ## Dependencies
 
 The main Python dependencies are managed via `pyproject.toml` and installed by `uv` within the Nix development shell:
 
-*   `numpy`
-*   `torch`
-*   `Cython`
-*   `packaging`
-*   `nemo_toolkit['asr']`
-*   `fastapi`
-*   `uvicorn`
-*   `pydub`
-*   `werkzeug`
-*   `shutil` # For file handling in FastAPI endpoint
+* `numpy`
+* `torch`
+* `Cython`
+* `packaging`
+* `nemo_toolkit['asr']`
+* `fastapi`
+* `uvicorn[standard]` (for WebSocket support)
+* `pydub`
+* `python-multipart` (for FastAPI file uploads)
+* `websockets` (though `uvicorn[standard]` should cover this for server-side)
+* `pyaudio` (for `client.py`)
 
 System-level dependencies, including CUDA and FFmpeg, are handled by the Nix environment defined in `flake.nix`.
 

@@ -18,7 +18,6 @@ WTYPE_AVAILABLE = shutil.which('wtype') is not None
 TYPING_AVAILABLE = WTYPE_AVAILABLE
 
 # --- Configuration ---
-WEBSOCKET_URI_BASE = "ws://localhost:5000/ws/transcribe_v3"
 RATE = 16000  # Sample rate (16kHz)
 VAD_CHUNK_DURATION_MS = 30 # VAD supports 10, 20, or 30 ms chunks
 VAD_CHUNK_SIZE = int(RATE * VAD_CHUNK_DURATION_MS / 1000)
@@ -33,11 +32,11 @@ def suppress_stderr():
     # Save original stderr file descriptor
     stderr_fd = sys.stderr.fileno()
     old_stderr_fd = os.dup(stderr_fd)
-    
+
     # Redirect stderr to /dev/null
     devnull_fd = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull_fd, stderr_fd)
-    
+
     try:
         yield
     finally:
@@ -47,18 +46,18 @@ def suppress_stderr():
         os.close(old_stderr_fd)
 
 class AudioClient:
-    def __init__(self, send_interval_ms=250, verbose=False, script_start_time=None, type_mode=False, type_delay=None):
+    def __init__(self, send_interval_ms=250, verbose=False, script_start_time=None, type_mode=False, type_delay=None, host="localhost", port=5000):
         # Suppress ALSA/JACK errors unless verbose mode
         if verbose:
             self.p = pyaudio.PyAudio()
         else:
             with suppress_stderr():
                 self.p = pyaudio.PyAudio()
-            
+
         self.vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
         self.send_interval_ms = send_interval_ms
         self.send_interval_bytes = int(RATE * CHANNELS * (self.send_interval_ms / 1000.0))
-        self.websocket_uri = f"{WEBSOCKET_URI_BASE}?chunk_duration_ms={self.send_interval_ms}"
+        self.websocket_uri = f"ws://{host}:{port}/ws/transcribe?chunk_duration_ms={self.send_interval_ms}"
         self.websocket = None
         self.audio_queue = queue.Queue()
         self.stop_event = threading.Event()
@@ -82,7 +81,7 @@ class AudioClient:
                              rate=RATE,
                              input=True,
                              frames_per_buffer=VAD_CHUNK_SIZE)
-        
+
         silence_start_time = None
         buffer = bytearray()
 
@@ -114,7 +113,7 @@ class AudioClient:
         try:
             while True:
                 message = await self.websocket.recv()
-                
+
                 if self.type_mode and TYPING_AVAILABLE:
                     # Type using wtype - add space after message
                     text_to_type = message + ' '
@@ -123,7 +122,7 @@ class AudioClient:
                     except subprocess.CalledProcessError as e:
                         if self.verbose:
                             print(f"wtype failed: {e}", file=sys.stderr)
-                
+
                 if self.verbose:
                     print(f"[{time.strftime('%H:%M:%S')}] Transcription: {message}", end=" ", flush=True, file=sys.stderr)
                     if not self.type_mode:  # Only print to stdout if not typing
@@ -131,7 +130,7 @@ class AudioClient:
                 else:
                     if not self.type_mode:  # Only print to stdout if not typing
                         self._print_with_delay(message + " ")
-                        
+
         except websockets.exceptions.ConnectionClosed:
             print("\nConnection to server closed.", file=sys.stderr)
         except Exception as e:
@@ -139,18 +138,18 @@ class AudioClient:
 
     async def record_and_stream(self):
         recording_start_time = time.time()
-        
+
         try:
             websocket_start_time = time.time()
             self.websocket = await websockets.connect(self.websocket_uri)
-            
+
             if self.verbose:
                 websocket_connect_time = time.time()
                 print(f"[PROFILE] WebSocket connection: {websocket_connect_time - websocket_start_time:.3f}s", file=sys.stderr)
                 if self.script_start_time:
                     print(f"[PROFILE] Total startup time: {websocket_connect_time - self.script_start_time:.3f}s", file=sys.stderr)
                 print("Recording started...", file=sys.stderr)
-            
+
             # Start the receiver task
             receiver_task = asyncio.create_task(self.receiver())
 
@@ -181,14 +180,16 @@ class AudioClient:
 
 if __name__ == "__main__":
     script_start_time = time.time()
-    
+
     parser = argparse.ArgumentParser(description="Client for streaming audio to the Parakeet ASR server.")
     parser.add_argument("--send_interval_ms", type=int, default=250,
                         help="Duration of each audio chunk sent to the server in milliseconds.")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose printing with timestamps.")
     parser.add_argument("--type", type=int, nargs="?", const=10, help="Type transcription into the focused window instead of printing to stdout. Optional delay in milliseconds (default: 10).")
+    parser.add_argument("--host", type=str, default="localhost", help="WebSocket server host (default: localhost).")
+    parser.add_argument("--port", type=int, default=5000, help="WebSocket server port (default: 5000).")
     args = parser.parse_args()
-    
+
     if args.type and not TYPING_AVAILABLE:
         print("Error: --type mode requires wtype. Install it with your package manager.", file=sys.stderr)
         sys.exit(1)
@@ -196,11 +197,11 @@ if __name__ == "__main__":
     if args.verbose:
         init_start_time = time.time()
         print(f"[PROFILE] Script startup: {init_start_time - script_start_time:.3f}s", file=sys.stderr)
-    
-    client = AudioClient(send_interval_ms=args.send_interval_ms, verbose=args.verbose, script_start_time=script_start_time, type_mode=args.type, type_delay=args.type if args.type else None)
-    
+
+    client = AudioClient(send_interval_ms=args.send_interval_ms, verbose=args.verbose, script_start_time=script_start_time, type_mode=args.type, type_delay=args.type if args.type else None, host=args.host, port=args.port)
+
     if args.verbose:
         client_init_time = time.time()
         print(f"[PROFILE] AudioClient initialization: {client_init_time - init_start_time:.3f}s", file=sys.stderr)
-    
+
     asyncio.run(client.record_and_stream())
