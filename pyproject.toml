@@ -18,4 +18,5 @@ dependencies = [
     "webrtcvad",
     "evdev-binary",
     "pyannote.audio",
+    "dotenv",
 ]
