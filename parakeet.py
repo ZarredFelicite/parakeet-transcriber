@@ -976,6 +976,11 @@ async def transcribe_diarize_endpoint(audio_file: UploadFile = File(...)):
                 diar_audio_path = temp_input_path
 
             # ------------------------------------------------------------------
+            # Ensure diar_audio_path is mono-16k WAV (required by pyannote)
+            # ------------------------------------------------------------------
+            diar_audio_path = convert_audio_to_wav_mono_16k(diar_audio_path, temp_dir)
+
+            # ------------------------------------------------------------------
             # ASR with timestamps (re-uses existing helper)
             # ------------------------------------------------------------------
             segment_length_sec = getattr(app.state, "segment_length_sec", 60)
@@ -1006,6 +1011,29 @@ async def transcribe_diarize_endpoint(audio_file: UploadFile = File(...)):
     except Exception as e:
         print(f"Error in /transcribe_diarize endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def convert_audio_to_wav_mono_16k(src_path: str, dst_dir: str) -> str:
+    """Convert *src_path* audio to a temporary mono 16-kHz WAV inside *dst_dir*.
+
+    Returns the path to the new WAV file. If *src_path* is already a WAV with
+    single channel and 16 kHz, the file is just copied to the destination.
+    """
+    # Determine destination path
+    base_name = os.path.splitext(os.path.basename(src_path))[0]
+    dst_path = os.path.join(dst_dir, f"{base_name}_16k_mono.wav")
+
+    try:
+        audio = AudioSegment.from_file(src_path)
+        if audio.channels > 1:
+            audio = audio.set_channels(1)
+        if audio.frame_rate != 16000:
+            audio = audio.set_frame_rate(16000)
+        audio.export(dst_path, format="wav")
+    except Exception as e:
+        raise RuntimeError(f"Failed to convert audio to WAV: {e}")
+
+    return dst_path
 
 
 if __name__ == "__main__":
