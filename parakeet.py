@@ -544,6 +544,111 @@ def process_and_transcribe_audio_file(input_path: str, segment_length_sec: int =
             print(f"Temporary directory {temp_dir_path} cleaned up.")
 
 
+def process_and_transcribe_audio_file_with_timestamps(input_path: str, segment_length_sec: int = 60):
+    """
+    Processes an audio (or extracts audio from video) similarly to
+    `process_and_transcribe_audio_file` **but** also collects segment–level
+    timestamps from NeMo by calling the model with ``timestamps=True``.
+
+    It returns a tuple ``(full_transcription, segments)`` where
+
+    - ``full_transcription`` is a single string containing the entire
+      transcription.
+    - ``segments`` is a list of dictionaries of the form
+      ``{"start": float, "end": float, "text": str}`` where *start* and *end*
+      are absolute times in **seconds** from the beginning of the original
+      media file.
+    """
+    asr_model = load_model()
+
+    temp_files = []
+    temp_dir = None
+    segments_output = []
+    all_transcriptions = []
+
+    try:
+        # Ensure the source file exists
+        if not os.path.exists(input_path):
+            return (f"Error: Input file not found at {input_path}", [])
+
+        # Work in a temporary directory so we do not touch the original media
+        temp_dir = tempfile.TemporaryDirectory()
+        temp_dir_path = temp_dir.name
+
+        file_extension = os.path.splitext(input_path)[1].lower()
+        video_extensions = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm']
+
+        # Extract or copy audio into the temp directory
+        if file_extension in video_extensions:
+            audio_for_processing_path = extract_audio_from_video(input_path, temp_dir_path)
+        else:
+            audio_filename = os.path.basename(input_path)
+            audio_for_processing_path = os.path.join(temp_dir_path, audio_filename)
+            shutil.copyfile(input_path, audio_for_processing_path)
+
+        # Load and normalise with pydub
+        audio = AudioSegment.from_file(audio_for_processing_path)
+        if audio.channels > 1:
+            audio = audio.set_channels(1)
+        if audio.frame_rate != 16000:
+            audio = audio.set_frame_rate(16000)
+
+        # Segment the audio to keep memory usage bounded
+        segment_length_ms = segment_length_sec * 1000
+        total_length_ms = len(audio)
+        num_segments = math.ceil(total_length_ms / segment_length_ms)
+
+        for i in range(num_segments):
+            start_time_ms = i * segment_length_ms
+            end_time_ms = min((i + 1) * segment_length_ms, total_length_ms)
+
+            segment = audio[start_time_ms:end_time_ms]
+
+            # Export segment to a temporary WAV file
+            with tempfile.NamedTemporaryFile(suffix=f"_{i}.wav", delete=False) as tmpfile:
+                temp_wav_path = tmpfile.name
+                temp_files.append(temp_wav_path)
+            segment.export(temp_wav_path, format='wav')
+
+            # Transcribe with timestamps
+            transcription_result = asr_model.transcribe([temp_wav_path], timestamps=True)
+
+            if transcription_result and len(transcription_result) > 0:
+                sample = transcription_result[0]
+                # Collect raw text
+                if hasattr(sample, 'text') and sample.text:
+                    all_transcriptions.append(sample.text)
+                else:
+                    all_transcriptions.append("")
+
+                # Collect segment-level timestamps (if provided by NeMo)
+                if hasattr(sample, 'timestamp') and 'segment' in sample.timestamp:
+                    for ts in sample.timestamp['segment']:
+                        segments_output.append({
+                            "start": ts['start'] + (start_time_ms / 1000.0),
+                            "end": ts['end'] + (start_time_ms / 1000.0),
+                            "text": ts['segment']
+                        })
+            else:
+                # Keep position in final transcription even if this chunk fails
+                all_transcriptions.append("[Transcription Failed for Segment]")
+
+        final_transcription = " ".join(all_transcriptions)
+        return (final_transcription, segments_output)
+
+    except Exception as e:
+        error_msg = f"An error occurred during audio processing: {type(e).__name__}: {e}"
+        return (error_msg, [])
+    finally:
+        # Clean up temporary WAV segment files
+        for p in temp_files:
+            if os.path.exists(p):
+                os.remove(p)
+        # Clean up the temporary directory
+        if temp_dir:
+            temp_dir.cleanup()
+
+
 # --- FastAPI App Definition and Server Mode ---
 app = FastAPI()
 
@@ -695,6 +800,48 @@ async def transcribe_endpoint(audio_file: UploadFile = File(...)):
             if transcription.startswith("Error:") or "[Transcription Failed for Segment]" in transcription:
                  return JSONResponse({"error": "Transcription failed or error during processing", "details": transcription}, status_code=500)
             return JSONResponse({"transcription": transcription})
+    except Exception as e:
+        print(f"Error handling transcription request for {audio_file.filename}: {e}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
+
+@app.post("/transcribe_timestamps")
+async def transcribe_timestamps_endpoint(audio_file: UploadFile = File(...)):
+    """
+    Upload an audio **or** video file and receive the transcription *along with*
+    absolute segment-level timestamps produced by the NeMo model.
+
+    Response JSON schema::
+        {
+            "transcription": "full transcription as a single string",
+            "segments": [
+                {"start": 0.0, "end": 4.23, "text": "first spoken segment"},
+                ...
+            ]
+        }
+    """
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_input_path = os.path.join(temp_dir, audio_file.filename)
+            with open(temp_input_path, "wb") as buffer:
+                shutil.copyfileobj(audio_file.file, buffer)
+
+            # Use the segment length configured for the application (default 60)
+            segment_length_sec = getattr(app.state, 'segment_length_sec', 60)
+
+            transcription, segments = process_and_transcribe_audio_file_with_timestamps(
+                temp_input_path,
+                segment_length_sec,
+            )
+
+            if transcription.startswith("Error:") or "[Transcription Failed for Segment]" in transcription:
+                return JSONResponse(
+                    {"error": "Transcription failed or error during processing", "details": transcription},
+                    status_code=500,
+                )
+
+            return JSONResponse({"transcription": transcription, "segments": segments})
+
     except Exception as e:
         print(f"Error handling transcription request for {audio_file.filename}: {e}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
