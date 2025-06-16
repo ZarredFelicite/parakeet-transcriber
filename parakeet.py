@@ -921,18 +921,32 @@ def annotate_segments_with_speakers(asr_segments, diarization_result):
 
 
 def join_consecutive_segments_by_speaker(annotated_segments):
-    """Merge consecutive segments that have identical speaker labels."""
+    """Merge consecutive segments by speaker while preserving individual segments.
+
+    Each element in the returned list contains an additional key ``segments``
+    which is a list of the original (un-merged) ASR segments belonging to that
+    speaker block.
+    """
     if not annotated_segments:
         return []
-    joined = [annotated_segments[0].copy()]
+
+    # Start with the first segment and initialise its list of sub-segments.
+    first = annotated_segments[0].copy()
+    first["segments"] = [annotated_segments[0].copy()]
+    joined = [first]
+
     for seg in annotated_segments[1:]:
         last = joined[-1]
         if seg["speaker"] == last["speaker"]:
-            # Extend the last segment
+            # Same speaker – extend end time, concatenate text, and store segment.
             last["end"] = seg["end"]
-            last["text"] = (last["text"] + " " + seg["text"].strip())
+            last["text"] = (last["text"] + " " + seg["text"].strip()).strip()
+            last["segments"].append(seg.copy())
         else:
-            joined.append(seg.copy())
+            new_entry = seg.copy()
+            new_entry["segments"] = [seg.copy()]
+            joined.append(new_entry)
+
     return joined
 
 
