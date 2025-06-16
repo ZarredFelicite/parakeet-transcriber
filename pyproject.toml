@@ -17,4 +17,5 @@ dependencies = [
     "websockets",
     "webrtcvad",
     "evdev-binary",
+    "pyannote.audio",
 ]

@@ -14,9 +14,15 @@ import time
 from collections import deque
 import asyncio
 import re # Added for websocket_v3 code
+import torch  # For device placement in diarization
+from pyannote.audio import Pipeline  # Speaker diarization
+from dotenv import load_dotenv  # To load HF token from .env if present
 
 # Global variable for the ASR model
 ASR_MODEL = None
+
+# Global variable for the diarization pipeline
+DIARIZATION_PIPELINE = None
 
 # --- Start of websocket_v3.py content ---
 
@@ -541,7 +547,6 @@ def process_and_transcribe_audio_file(input_path: str, segment_length_sec: int =
         # Clean up the main temporary directory
         if temp_dir:
             temp_dir.cleanup()
-            print(f"Temporary directory {temp_dir_path} cleaned up.")
 
 
 def process_and_transcribe_audio_file_with_timestamps(input_path: str, segment_length_sec: int = 60):
@@ -845,6 +850,162 @@ async def transcribe_timestamps_endpoint(audio_file: UploadFile = File(...)):
     except Exception as e:
         print(f"Error handling transcription request for {audio_file.filename}: {e}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
+
+
+def load_diarization_pipeline():
+    """Load (or return cached) speaker-diarization pipeline."""
+    global DIARIZATION_PIPELINE
+    if DIARIZATION_PIPELINE is None:
+        # Ensure we have the token (either already in env or loaded from .env)
+        load_dotenv()
+        hf_token = os.getenv("HUGGINGFACE_ACCESS_TOKEN", "")
+        if hf_token == "":
+            raise EnvironmentError(
+                "HUGGINGFACE_ACCESS_TOKEN not set in environment or .env file; required for diarization pipeline."  # noqa: E501
+            )
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Loading pyannote speaker-diarization pipeline on {device}…")
+        DIARIZATION_PIPELINE = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1",
+            use_auth_token=hf_token,
+        )
+        DIARIZATION_PIPELINE.to(device)
+    return DIARIZATION_PIPELINE
+
+
+# ---------------------------------------------------------------------------
+# Helper to tag ASR segments with speaker labels
+# ---------------------------------------------------------------------------
+
+def annotate_segments_with_speakers(asr_segments, diarization_result):
+    """Return list of ASR segments augmented with a *speaker* key.
+
+    Parameters
+    ----------
+    asr_segments : list[dict]
+        Each dict must have ``start`` & ``end`` times (seconds) plus ``text``.
+    diarization_result : pyannote.core.Annotation
+        Result returned by ``Pipeline``.
+    Returns
+    -------
+    list[dict]
+        Same length as *asr_segments* with an extra ``speaker`` entry.
+    """
+    # Build list of diarization segments with speaker labels for quick overlap calc
+    diar_segments = []
+    for turn, _, speaker_label in diarization_result.itertracks(yield_label=True):
+        diar_segments.append(
+            {
+                "start": float(turn.start),
+                "end": float(turn.end),
+                "speaker": str(speaker_label),
+            }
+        )
+
+    annotated = []
+    for seg in asr_segments:
+        # Compute total overlap per speaker
+        overlaps = {}
+        for d in diar_segments:
+            start = max(seg["start"], d["start"])
+            end = min(seg["end"], d["end"])
+            if end > start:  # positive overlap
+                overlaps[d["speaker"]] = overlaps.get(d["speaker"], 0.0) + (end - start)
+        # Pick speaker with max overlap (>0) else unknown
+        if overlaps:
+            speaker = max(overlaps, key=overlaps.get)
+        else:
+            speaker = "unknown"
+        annotated.append({**seg, "speaker": speaker})
+    return annotated
+
+
+def join_consecutive_segments_by_speaker(annotated_segments):
+    """Merge consecutive segments that have identical speaker labels."""
+    if not annotated_segments:
+        return []
+    joined = [annotated_segments[0].copy()]
+    for seg in annotated_segments[1:]:
+        last = joined[-1]
+        if seg["speaker"] == last["speaker"]:
+            # Extend the last segment
+            last["end"] = seg["end"]
+            last["text"] = (last["text"] + " " + seg["text"].strip())
+        else:
+            joined.append(seg.copy())
+    return joined
+
+
+@app.post("/transcribe_diarize")
+async def transcribe_diarize_endpoint(audio_file: UploadFile = File(...)):
+    """Transcribe + diarize audio/video and tag each segment with the speaker.
+
+    Response example::
+        {
+            "segments": [
+                {"start": 0.0, "end": 3.2, "speaker": "SPEAKER_00", "text": "Hello there."},
+                {"start": 3.2, "end": 7.5, "speaker": "SPEAKER_01", "text": "Hi!"}
+            ]
+        }
+    """
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # ------------------------------------------------------------------
+            # Save uploaded file
+            # ------------------------------------------------------------------
+            temp_input_path = os.path.join(temp_dir, audio_file.filename)
+            with open(temp_input_path, "wb") as buffer:
+                shutil.copyfileobj(audio_file.file, buffer)
+
+            # ------------------------------------------------------------------
+            # If video, extract audio for both ASR & diarization
+            # ------------------------------------------------------------------
+            file_extension = os.path.splitext(temp_input_path)[1].lower()
+            video_ext = [
+                ".mp4",
+                ".mkv",
+                ".avi",
+                ".mov",
+                ".wmv",
+                ".flv",
+                ".webm",
+            ]
+            if file_extension in video_ext:
+                diar_audio_path = extract_audio_from_video(temp_input_path, temp_dir)
+            else:
+                diar_audio_path = temp_input_path
+
+            # ------------------------------------------------------------------
+            # ASR with timestamps (re-uses existing helper)
+            # ------------------------------------------------------------------
+            segment_length_sec = getattr(app.state, "segment_length_sec", 60)
+            transcription, asr_segments = process_and_transcribe_audio_file_with_timestamps(
+                diar_audio_path, segment_length_sec
+            )
+
+            if transcription.startswith("Error:"):
+                return JSONResponse(
+                    {"error": "ASR processing failed", "details": transcription},
+                    status_code=500,
+                )
+
+            # ------------------------------------------------------------------
+            # Diarization
+            # ------------------------------------------------------------------
+            diar_pipeline = load_diarization_pipeline()
+            diar_result = diar_pipeline(diar_audio_path)
+
+            # ------------------------------------------------------------------
+            # Annotate & join segments
+            # ------------------------------------------------------------------
+            annotated = annotate_segments_with_speakers(asr_segments, diar_result)
+            joined_segments = join_consecutive_segments_by_speaker(annotated)
+
+            return JSONResponse({"segments": joined_segments})
+
+    except Exception as e:
+        print(f"Error in /transcribe_diarize endpoint: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
