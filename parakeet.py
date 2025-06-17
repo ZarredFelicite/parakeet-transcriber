@@ -17,12 +17,19 @@ import re # Added for websocket_v3 code
 import torch  # For device placement in diarization
 from pyannote.audio import Pipeline  # Speaker diarization
 from dotenv import load_dotenv  # To load HF token from .env if present
+import hdbscan  # For clustering embeddings
+from pyannote.audio.pipelines.speaker_verification import PretrainedSpeakerEmbedding
+from pyannote.audio import Audio
+from pyannote.core import Segment
 
 # Global variable for the ASR model
 ASR_MODEL = None
 
 # Global variable for the diarization pipeline
 DIARIZATION_PIPELINE = None
+
+# Global variable for the speaker-embedding model
+EMBEDDING_MODEL = None
 
 # --- Start of websocket_v3.py content ---
 
@@ -1048,6 +1055,129 @@ def convert_audio_to_wav_mono_16k(src_path: str, dst_dir: str) -> str:
         raise RuntimeError(f"Failed to convert audio to WAV: {e}")
 
     return dst_path
+
+
+# ---------------------------------------------------------------------------
+# Speaker-embedding + clustering utilities
+# ---------------------------------------------------------------------------
+
+def load_embedding_model():
+    """Load (or return cached) speaker-embedding model."""
+    global EMBEDDING_MODEL
+    if EMBEDDING_MODEL is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Loading speaker-embedding model on {device}…")
+        EMBEDDING_MODEL = PretrainedSpeakerEmbedding(
+            "speechbrain/spkrec-ecapa-voxceleb", device=device
+        )
+    return EMBEDDING_MODEL
+
+
+def compute_segment_embeddings(audio_path: str, segments):
+    """Return list of embedding vectors corresponding to *segments* time spans."""
+    model = load_embedding_model()
+    audio_helper = Audio(sample_rate=16000, mono="downmix")
+
+    embeds = []
+    for seg in segments:
+        try:
+            waveform, _ = audio_helper.crop(audio_path, Segment(seg["start"], seg["end"]))
+            emb = model(waveform[None]).detach().cpu().numpy()[0]
+            embeds.append(emb)
+        except Exception as e:
+            raise RuntimeError(f"Failed to compute embedding for segment {seg}: {e}")
+    return embeds
+
+
+def cluster_embeddings(embeddings):
+    """Cluster embeddings with HDBSCAN and return label list."""
+    if len(embeddings) <= 1:
+        return [0] * len(embeddings)
+
+    emb_arr = np.vstack(embeddings)
+    # Small datasets may require min_cluster_size 1, but HDBSCAN needs >=2.
+    min_cluster = 2 if len(embeddings) >= 2 else 1
+    clusterer = hdbscan.HDBSCAN(min_cluster_size=min_cluster, metric="euclidean")
+    labels = clusterer.fit_predict(emb_arr)
+    return labels.tolist()
+
+
+def assign_cluster_labels(segments, labels):
+    """Attach human-readable speaker_{n} label to each segment based on *labels*."""
+    speaker_map = {}
+    next_idx = 1
+    for seg, lab in zip(segments, labels):
+        if lab == -1:
+            seg["speaker"] = "unknown"
+        else:
+            if lab not in speaker_map:
+                speaker_map[lab] = f"speaker_{next_idx}"
+                next_idx += 1
+            seg["speaker"] = speaker_map[lab]
+    return segments
+
+
+# ---------------------------------------------------------------------------
+# Endpoint: ASR + speaker embedding clustering (no full diarization)
+# ---------------------------------------------------------------------------
+
+@app.post("/transcribe_cluster")
+async def transcribe_cluster_endpoint(audio_file: UploadFile = File(...)):
+    """Transcribe audio and cluster segments by speaker embeddings.
+
+    Returns a JSON with merged segments (same format as `/transcribe_diarize`)
+    but speaker labels are derived from HDBSCAN clustering of ECAPA embeddings.
+    """
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Save upload
+            temp_input_path = os.path.join(temp_dir, audio_file.filename)
+            with open(temp_input_path, "wb") as buffer:
+                shutil.copyfileobj(audio_file.file, buffer)
+
+            # Extract audio if video & ensure mono-16k WAV
+            file_extension = os.path.splitext(temp_input_path)[1].lower()
+            video_ext = [
+                ".mp4",
+                ".mkv",
+                ".avi",
+                ".mov",
+                ".wmv",
+                ".flv",
+                ".webm",
+            ]
+            if file_extension in video_ext:
+                asr_audio_path = extract_audio_from_video(temp_input_path, temp_dir)
+            else:
+                asr_audio_path = temp_input_path
+
+            asr_audio_path = convert_audio_to_wav_mono_16k(asr_audio_path, temp_dir)
+
+            # ASR with timestamps
+            segment_length_sec = getattr(app.state, "segment_length_sec", 60)
+            transcription, asr_segments = process_and_transcribe_audio_file_with_timestamps(
+                asr_audio_path, segment_length_sec
+            )
+
+            if transcription.startswith("Error:"):
+                return JSONResponse(
+                    {"error": "ASR processing failed", "details": transcription},
+                    status_code=500,
+                )
+
+            # Speaker embeddings & clustering
+            embeddings = compute_segment_embeddings(asr_audio_path, asr_segments)
+            labels = cluster_embeddings(embeddings)
+            annotated_segments = assign_cluster_labels(asr_segments, labels)
+
+            # Optionally merge consecutive identical speakers for compactness
+            joined_segments = join_consecutive_segments_by_speaker(annotated_segments)
+
+            return JSONResponse({"segments": joined_segments})
+
+    except Exception as e:
+        print(f"Error in /transcribe_cluster endpoint: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
