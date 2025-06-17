@@ -21,6 +21,9 @@ import hdbscan  # For clustering embeddings
 from pyannote.audio.pipelines.speaker_verification import PretrainedSpeakerEmbedding
 from pyannote.audio import Audio
 from pyannote.core import Segment
+import matplotlib.pyplot as plt  # For plotting embeddings
+from sklearn.manifold import TSNE
+from sklearn.decomposition import PCA
 
 # Global variable for the ASR model
 ASR_MODEL = None
@@ -1127,6 +1130,53 @@ def assign_cluster_labels(segments, labels):
 
 
 # ---------------------------------------------------------------------------
+# Visualization helper
+# ---------------------------------------------------------------------------
+
+def save_embedding_projection_plot(embeddings, labels, out_path):
+    """Project high-dim speaker embeddings to 2-D and save a scatter plot.
+
+    Uses TSNE for <= 100 points; PCA otherwise (faster). Unknown labels (-1)
+    are plotted in gray.
+    """
+    if len(embeddings) == 0:
+        return None
+
+    emb_arr = np.vstack(embeddings)
+
+    if len(embeddings) <= 100:
+        reducer = TSNE(n_components=2, perplexity=min(30, max(5, len(embeddings) // 2)), random_state=0)
+        coords = reducer.fit_transform(emb_arr)
+    else:
+        reducer = PCA(n_components=2)
+        coords = reducer.fit_transform(emb_arr)
+
+    # Prepare color palette
+    unique_labels = sorted(set(labels))
+    cmap = plt.get_cmap("tab10")
+
+    plt.figure(figsize=(6, 6))
+    for lab in unique_labels:
+        idxs = [i for i, l in enumerate(labels) if l == lab]
+        xs = coords[idxs, 0]
+        ys = coords[idxs, 1]
+        if lab == -1:
+            color = "#888888"
+            label_name = "unknown"
+        else:
+            color = cmap(lab % 10)
+            label_name = f"cluster {lab}"
+        plt.scatter(xs, ys, c=[color], label=label_name, alpha=0.7, edgecolors="none")
+
+    plt.legend(loc="best", fontsize=8)
+    plt.title("Speaker embedding clusters (2-D projection)")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    return out_path
+
+
+# ---------------------------------------------------------------------------
 # Endpoint: ASR + speaker embedding clustering (no full diarization)
 # ---------------------------------------------------------------------------
 
@@ -1182,7 +1232,19 @@ async def transcribe_cluster_endpoint(audio_file: UploadFile = File(...)):
             # Optionally merge consecutive identical speakers for compactness
             joined_segments = join_consecutive_segments_by_speaker(annotated_segments)
 
-            return JSONResponse({"segments": joined_segments})
+            # Save embedding projection plot for debugging/inspection
+            try:
+                plot_path = os.path.join(temp_dir, "embedding_projection.png")
+                save_embedding_projection_plot(embeddings, labels, plot_path)
+            except Exception as e:
+                print(f"Failed to generate embedding plot: {e}")
+                plot_path = None
+
+            response_payload = {"segments": joined_segments}
+            if plot_path:
+                response_payload["embedding_plot"] = plot_path
+
+            return JSONResponse(response_payload)
 
     except Exception as e:
         print(f"Error in /transcribe_cluster endpoint: {e}")
