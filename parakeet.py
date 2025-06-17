@@ -1081,9 +1081,18 @@ def compute_segment_embeddings(audio_path: str, segments):
     embeds = []
     for seg in segments:
         try:
-            waveform, _ = audio_helper.crop(audio_path, Segment(seg["start"], seg["end"]))
-            emb = model(waveform[None]).detach().cpu().numpy()[0]
-            embeds.append(emb)
+            waveform, _ = audio_helper.crop(
+                audio_path, Segment(seg["start"], seg["end"])
+            )
+
+            # Model returns either a NumPy array or a torch.Tensor depending on version
+            emb_out = model(waveform[None])
+            if isinstance(emb_out, torch.Tensor):
+                emb_np = emb_out.detach().cpu().numpy()
+            else:  # assume NumPy ndarray
+                emb_np = emb_out
+
+            embeds.append(emb_np.squeeze())
         except Exception as e:
             raise RuntimeError(f"Failed to compute embedding for segment {seg}: {e}")
     return embeds
