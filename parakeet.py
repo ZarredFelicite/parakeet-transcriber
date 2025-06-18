@@ -4,7 +4,7 @@ import nemo.collections.asr as nemo_asr
 from pydub import AudioSegment
 import tempfile
 import math
-from fastapi import FastAPI, File, UploadFile, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, UploadFile, HTTPException, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import JSONResponse
 import shutil # Needed for saving the uploaded file
 import subprocess # For running ffmpeg
@@ -24,6 +24,11 @@ from pyannote.core import Segment
 import matplotlib.pyplot as plt  # For plotting embeddings
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
+import uuid
+import soundfile as sf  # For writing temporary WAVs for Titanet
+from sklearn.neighbors import NearestNeighbors
+import requests  # For calling OpenAI API
+import json
 
 # Global variable for the ASR model
 ASR_MODEL = None
@@ -31,8 +36,8 @@ ASR_MODEL = None
 # Global variable for the diarization pipeline
 DIARIZATION_PIPELINE = None
 
-# Global variable for the speaker-embedding model
-EMBEDDING_MODEL = None
+# Cache of speaker-embedding models keyed by name
+EMBEDDING_MODELS = {}
 
 # --- Start of websocket_v3.py content ---
 
@@ -1064,40 +1069,87 @@ def convert_audio_to_wav_mono_16k(src_path: str, dst_dir: str) -> str:
 # Speaker-embedding + clustering utilities
 # ---------------------------------------------------------------------------
 
-def load_embedding_model():
-    """Load (or return cached) speaker-embedding model."""
-    global EMBEDDING_MODEL
-    if EMBEDDING_MODEL is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Loading speaker-embedding model on {device}…")
-        EMBEDDING_MODEL = PretrainedSpeakerEmbedding(
-            "speechbrain/spkrec-ecapa-voxceleb", device=device
-        )
-    return EMBEDDING_MODEL
+def load_embedding_model(model_type: str = "ecapa"):
+    """Return a speaker-embedding model instance for *model_type* (cached)."""
+    model_type = model_type.lower()
+    if model_type in EMBEDDING_MODELS:
+        return EMBEDDING_MODELS[model_type]
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[Embeddings] Loading '{model_type}' model on {device} …")
+
+    if model_type == "ecapa":
+        model = PretrainedSpeakerEmbedding("speechbrain/spkrec-ecapa-voxceleb", device=device)
+    elif model_type == "titanet":
+        model = nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained(model_name="titanet_large").to(device).eval()
+    else:
+        raise ValueError(f"Unsupported embedding model_type '{model_type}'")
+
+    EMBEDDING_MODELS[model_type] = model
+    return model
 
 
-def compute_segment_embeddings(audio_path: str, segments):
-    """Return list of embedding vectors corresponding to *segments* time spans."""
-    model = load_embedding_model()
+def compute_segment_embeddings(audio_path: str, segments, model_type: str = "ecapa"):
+    """Compute and return list of embeddings for *segments*.
+
+    model_type options:
+      - "ecapa"
+      - "titanet"
+      - "combo"  → concatenation of ECAPA and Titanet vectors
+    """
+
+    model_type = model_type.lower()
     audio_helper = Audio(sample_rate=16000, mono="downmix")
+
+    def _single_embedding(single_model: str, seg):
+        mdl = load_embedding_model(single_model)
+        if single_model == "titanet":
+            waveform_t, _ = audio_helper.crop(audio_path, Segment(seg["start"], seg["end"]))
+            waveform_np = waveform_t.squeeze().numpy()
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmpwav:
+                export_path = tmpwav.name
+            sf.write(export_path, waveform_np, 16000)
+            emb_tensor = mdl.get_embedding(export_path)
+            os.remove(export_path)
+            emb_np = (
+                emb_tensor.detach().cpu().numpy()
+                if isinstance(emb_tensor, torch.Tensor)
+                else emb_tensor
+            ).squeeze()
+            norm = np.linalg.norm(emb_np)
+            if norm > 0:
+                emb_np = emb_np / norm
+            return emb_np
+        else:  # ecapa
+            waveform, _ = audio_helper.crop(audio_path, Segment(seg["start"], seg["end"]))
+            emb_out = mdl(waveform[None])
+            emb_np = (
+                emb_out.detach().cpu().numpy()
+                if isinstance(emb_out, torch.Tensor)
+                else emb_out
+            ).squeeze()
+            norm = np.linalg.norm(emb_np)
+            if norm > 0:
+                emb_np = emb_np / norm
+            return emb_np
 
     embeds = []
     for seg in segments:
         try:
-            waveform, _ = audio_helper.crop(
-                audio_path, Segment(seg["start"], seg["end"])
-            )
+            if model_type == "combo":
+                ecapa_emb = _single_embedding("ecapa", seg)
+                titan_emb = _single_embedding("titanet", seg)
+                emb_np = np.concatenate([ecapa_emb, titan_emb])
+                norm = np.linalg.norm(emb_np)
+                if norm > 0:
+                    emb_np = emb_np / norm
+            else:
+                emb_np = _single_embedding(model_type, seg)
 
-            # Model returns either a NumPy array or a torch.Tensor depending on version
-            emb_out = model(waveform[None])
-            if isinstance(emb_out, torch.Tensor):
-                emb_np = emb_out.detach().cpu().numpy()
-            else:  # assume NumPy ndarray
-                emb_np = emb_out
-
-            embeds.append(emb_np.squeeze())
+            embeds.append(emb_np)
         except Exception as e:
             raise RuntimeError(f"Failed to compute embedding for segment {seg}: {e}")
+
     return embeds
 
 
@@ -1108,8 +1160,14 @@ def cluster_embeddings(embeddings):
 
     emb_arr = np.vstack(embeddings)
     # Small datasets may require min_cluster_size 1, but HDBSCAN needs >=2.
-    min_cluster = 2 if len(embeddings) >= 2 else 1
-    clusterer = hdbscan.HDBSCAN(min_cluster_size=min_cluster, metric="euclidean")
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=5,
+        metric="euclidean",
+        min_samples=2,
+        #cluster_selection_epsilon=0.1,
+        cluster_selection_method="eom",
+        #alpha=0.5,
+    )
     labels = clusterer.fit_predict(emb_arr)
     return labels.tolist()
 
@@ -1177,11 +1235,138 @@ def save_embedding_projection_plot(embeddings, labels, out_path):
 
 
 # ---------------------------------------------------------------------------
+# Post-processing: assign HDBSCAN noise (-1) points via k-nearest neighbors
+# ---------------------------------------------------------------------------
+
+def knn_fill_noise_labels(embeddings, labels, k: int = 5, distance_threshold: float = 2):
+    """Assign cluster labels to HDBSCAN noise points using k-NN.
+
+    Parameters
+    ----------
+    embeddings : list[np.ndarray] | np.ndarray
+        The same embeddings array passed to HDBSCAN.
+    labels : list[int]
+        Labels output by HDBSCAN (with -1 for noise).
+    k : int, optional
+        Number of neighbors to consider for voting.
+    distance_threshold : float, optional
+        Maximum average distance to the *k* neighbors allowed for adopting the
+        neighbor majority label. Larger values -> more assignments.
+    Returns
+    -------
+    list[int]
+        New label list where some previous `-1` elements may be replaced by a
+        positive cluster id.
+    """
+    emb_arr = np.vstack(embeddings)
+    labels = np.asarray(labels)
+
+    core_mask = labels != -1
+    noise_mask = labels == -1
+
+    if core_mask.sum() == 0 or noise_mask.sum() == 0:
+        return labels.tolist()
+
+    core_emb = emb_arr[core_mask]
+    core_labels = labels[core_mask]
+
+    k = min(k, core_emb.shape[0])
+    nbrs = NearestNeighbors(n_neighbors=k, metric="euclidean").fit(core_emb)
+    dists, idxs = nbrs.kneighbors(emb_arr[noise_mask])
+
+    new_labels = labels.copy()
+    for i_noise, (dist_row, idx_row) in enumerate(zip(dists, idxs)):
+        mean_dist = dist_row.mean()
+        if mean_dist <= distance_threshold:
+            neighbor_labels = core_labels[idx_row]
+            # vote majority
+            counts = np.bincount(neighbor_labels)
+            pred_lab = counts.argmax()
+            new_labels[np.where(noise_mask)[0][i_noise]] = pred_lab
+    return new_labels.tolist()
+
+
+# ---------------------------------------------------------------------------
+# OpenAI name inference helper
+# ---------------------------------------------------------------------------
+
+def replace_speaker_ids_with_names(segments):
+    """Call OpenAI API to infer names for speaker ids and apply replacements.
+
+    The function builds a prompt containing the dialogue. It expects the model
+    to return a JSON object mapping original ids (e.g. "speaker_1") to a
+    dash-separated lower-case name string (e.g. "john" or "customer-service").
+    """
+    load_dotenv()
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not set in environment or .env file")
+
+    # Build transcript string
+    dialogue_lines = [f"{seg['speaker']}: {seg['text']}" for seg in segments]
+    dialogue_text = "\n".join(dialogue_lines)
+
+    system_prompt = (
+        "You are an assistant that extracts speaker NAMES explicitly mentioned in a conversation.\n"
+        "Input format: each line starts with a speaker id like 'speaker_1:' followed by speech.\n"
+        "If a speaker clearly says their own name or is addressed by name, map that id to the name.\n"
+        "If NO spoken name can be found for an id, leave the id unchanged (do NOT invent roles or titles).\n"
+        "Return ONLY a JSON object mapping original ids to new names.\n"
+        "Names must be lower-case, words joined by single dashes (e.g. 'john-doe'). No spaces or other punctuation."
+    )
+
+    user_prompt = (
+        "Here is the transcript:\n\n" + dialogue_text + "\n\n" +
+        "Return the JSON mapping now."
+    )
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": "gpt-o4-mini",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.2,
+    }
+
+    resp = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=30)
+    resp.raise_for_status()
+    content = resp.json()["choices"][0]["message"]["content"].strip()
+
+    try:
+        mapping = json.loads(content)
+    except json.JSONDecodeError:
+        print("[OpenAI] Failed to parse JSON response, leaving labels unchanged.")
+        return segments
+
+    # Apply mapping
+    for seg in segments:
+        if seg["speaker"] in mapping:
+            seg["speaker"] = mapping[seg["speaker"]]
+        # update sub-segments too
+        if "segments" in seg:
+            for sub in seg["segments"]:
+                if sub["speaker"] in mapping:
+                    sub["speaker"] = mapping[sub["speaker"]]
+
+    return segments
+
+
+# ---------------------------------------------------------------------------
 # Endpoint: ASR + speaker embedding clustering (no full diarization)
 # ---------------------------------------------------------------------------
 
 @app.post("/transcribe_cluster")
-async def transcribe_cluster_endpoint(audio_file: UploadFile = File(...)):
+async def transcribe_cluster_endpoint(
+    audio_file: UploadFile = File(...),
+    model: str = Query("ecapa", description="Speaker embedding model: 'ecapa' or 'titanet"),
+    name_labels: bool = Query(False, description="Use OpenAI to guess names and replace speaker ids"),
+):
     """Transcribe audio and cluster segments by speaker embeddings.
 
     Returns a JSON with merged segments (same format as `/transcribe_diarize`)
@@ -1225,16 +1410,29 @@ async def transcribe_cluster_endpoint(audio_file: UploadFile = File(...)):
                 )
 
             # Speaker embeddings & clustering
-            embeddings = compute_segment_embeddings(asr_audio_path, asr_segments)
+            embeddings = compute_segment_embeddings(asr_audio_path, asr_segments, model_type=model.lower())
             labels = cluster_embeddings(embeddings)
+            # Fill HDBSCAN noise points using k-NN to nearest clusters
+            labels = knn_fill_noise_labels(embeddings, labels)
             annotated_segments = assign_cluster_labels(asr_segments, labels)
 
             # Optionally merge consecutive identical speakers for compactness
             joined_segments = join_consecutive_segments_by_speaker(annotated_segments)
 
+            # ------------------------------------------------------------------
+            # Optional: replace speaker IDs with human-friendly names via OpenAI
+            # ------------------------------------------------------------------
+            if name_labels:
+                try:
+                    joined_segments = replace_speaker_ids_with_names(joined_segments)
+                except Exception as e:
+                    print(f"Name replacement failed: {e}")
+
             # Save embedding projection plot for debugging/inspection
             try:
-                plot_path = os.path.join(temp_dir, "embedding_projection.png")
+                plot_filename = f"embedding_projection_{uuid.uuid4().hex[:8]}.png"
+                print(f"Saving embedding plot to {plot_filename}")
+                plot_path = os.path.join("/tmp", plot_filename)
                 save_embedding_projection_plot(embeddings, labels, plot_path)
             except Exception as e:
                 print(f"Failed to generate embedding plot: {e}")
