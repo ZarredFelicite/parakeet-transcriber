@@ -82,139 +82,206 @@ def normalize_word_for_matching(word):
 
 
 class WordState:
-    def __init__(self, word):
-        self.clean_word = strip_punctuation(word)
-        self.frequency = 1
-        self.latest_form = word # with punctuation
+    def __init__(self, word, prev_word=None, next_word=None, frequency=1):
+        self.word = word  # Original word with punctuation
+        self.word_clean = strip_punctuation(word)  # Clean word for matching
+        self.prev_word = strip_punctuation(prev_word) if prev_word else None
+        self.next_word = strip_punctuation(next_word) if next_word else None
+        self.frequency = frequency
+        self.state = "unconfirmed"  # "unconfirmed", "potential", "confirmed"
+        self.first_seen = time.time()
         self.last_seen = time.time()
+        self.latest_form = word  # Track latest punctuation variant
 
-    def increment(self, word_variant):
+    def increment_frequency(self, word_variant):
         self.frequency += 1
-        self.latest_form = word_variant
         self.last_seen = time.time()
+        self.latest_form = word_variant  # Update to latest punctuation form
+        self._update_state()
 
-    def should_graduate(self, threshold=4):
-        # Lower threshold for proper nouns (capitalized)
-        grad_threshold = 3 if self.clean_word.istitle() and len(self.clean_word) > 1 else threshold
-        return self.frequency >= grad_threshold
+    def get_context_key(self):
+        """Return a key that includes word and context for uniqueness"""
+        # Include the original word to prevent context collisions
+        return (self.word_clean, self.prev_word, self.next_word, self.word)
 
-    def __repr__(self):
-        return f"'{self.latest_form}'(f={self.frequency})"
+    def _update_state(self):
+        if self.frequency >= 4:
+            self.state = "confirmed"
+        elif self.frequency >= 2:
+            self.state = "potential"
+        else:
+            self.state = "unconfirmed"
+
+    def should_graduate(self):
+        return self.state == "confirmed"
+
+    def get_output_word(self):
+        """Return the word form to output (with latest punctuation)"""
+        return self.latest_form
+
+    def __str__(self):
+        context = f"[{self.prev_word or ''}-{self.next_word or ''}]"
+        return f"{self.latest_form}({self.frequency}:{self.state}){context}"
 
 
 class TranscriptionTracker:
-    def __init__(self, max_rewind=5, grad_threshold=4):
-        self.word_states = {}  # clean_word -> WordState
-        self.confirmed_words = []
-        self.normalized_confirmed_words = []
-        self.max_rewind = max_rewind
-        self.grad_threshold = grad_threshold
+    def __init__(self, min_confirmed_words=4):
+        self.word_states = {}  # context_key -> WordState
+        self.confirmed_words = []  # Simple list of confirmed words (no context)
+        self.sent_words_count = 0
+        self.min_confirmed_words = min_confirmed_words  # Stop removing words when we reach this many
 
     def process_transcription(self, words, verbose=False):
-        if not words:
-            return []
+        new_words_to_send = []
 
-        # 1. Update frequencies
-        for word in words:
-            clean_word = strip_punctuation(word)
-            if clean_word in self.word_states:
-                self.word_states[clean_word].increment(word)
+        # Update word frequencies using context-aware keys
+        for i, word in enumerate(words):
+            prev_word = words[i-1] if i > 0 else None
+            next_word = words[i+1] if i < len(words)-1 else None
+
+            word_state = WordState(word, prev_word, next_word)
+            context_key = word_state.get_context_key()
+
+            if context_key in self.word_states:
+                # Only increment if not already confirmed (to stop counting at 4)
+                existing_state = self.word_states[context_key]
+                if existing_state.frequency < 4:
+                    existing_state.increment_frequency(word)
+                else:
+                    # Update latest form but don't increment frequency
+                    existing_state.latest_form = word
             else:
-                self.word_states[clean_word] = WordState(word)
+                self.word_states[context_key] = word_state
 
-        # 2. Find alignment point
+        # Find where our confirmed sequence ends in the current transcription
         start_index = 0
-        if self.normalized_confirmed_words:
-            normalized_current = [normalize_word_for_matching(w) for w in words]
-            max_overlap = min(len(self.normalized_confirmed_words), len(normalized_current))
-            
+        words_clean = [strip_punctuation(w) for w in words]
+
+        # Search only in the last 20 words to avoid duplicate sequence matches
+        search_start = max(0, len(words_clean) - 20)
+
+        # Efficient prefix alignment: find the longest prefix of current words
+        # that exactly equals the tail of confirmed_words. This prevents re-sending
+        # previously confirmed words while avoiding complex fuzzy matching.
+        if self.confirmed_words:
+            max_overlap = min(len(self.confirmed_words), len(words))
+            start_index = 0
             for overlap in range(max_overlap, 0, -1):
-                tail = self.normalized_confirmed_words[-overlap:]
-                head = normalized_current[:overlap]
+                tail = [strip_punctuation(w) for w in self.confirmed_words[-overlap:]]
+                head = [strip_punctuation(w) for w in words[:overlap]]
                 if tail == head:
                     start_index = overlap
                     break
-        
-        # 3. Backtrack guard
-        if start_index < len(self.confirmed_words) - self.max_rewind:
-            if verbose:
-                print(f"[WARN] Large backtrack detected (from {len(self.confirmed_words)} to {start_index}). Suppressing.")
-            return []
+        else:
+            start_index = 0
 
-        # 4. Graduate new words
-        newly_confirmed = []
+        # Graduate words in strict sequential order from where confirmed sequence ends
         if verbose:
             print(f"[GRAD] Starting from index {start_index}, confirmed_words: {len(self.confirmed_words)}")
-
         for i in range(start_index, len(words)):
             word = words[i]
-            clean_word = strip_punctuation(word)
-            
-            if clean_word in self.word_states:
-                state = self.word_states[clean_word]
-                if state.should_graduate(self.grad_threshold):
-                    newly_confirmed.append(state.latest_form)
+            prev_word = words[i-1] if i > 0 else None
+            next_word = words[i+1] if i < len(words)-1 else None
+
+            # Create context key for this specific word instance
+            temp_word_state = WordState(word, prev_word, next_word)
+            context_key = temp_word_state.get_context_key()
+
+            if context_key in self.word_states:
+                word_state = self.word_states[context_key]
+                if word_state.should_graduate():
+                    # This word can be graduated - use latest punctuation form
+                    output_word = word_state.get_output_word()
+                    self.confirmed_words.append(output_word)
+                    new_words_to_send.append(output_word)
+                    self.sent_words_count += 1
                 else:
+                    # Stop at first non-graduated word to maintain order
                     if verbose:
-                        print(f"[GRAD] Stopped at '{word}' (freq={state.frequency}/{self.grad_threshold})")
+                        print(f"[GRAD] Stopped at '{word}' (freq={word_state.frequency}/4)")
                     break
             else:
+                # Word context not found, stop graduation
                 if verbose:
-                    print(f"[GRAD] Stopped at '{word}' - no state found.")
+                    print(f"[GRAD] Stopped at '{word}' - not seen before")
                 break
-        
-        if newly_confirmed:
-            self.confirmed_words.extend(newly_confirmed)
-            self.normalized_confirmed_words.extend([normalize_word_for_matching(w) for w in newly_confirmed])
 
-        return newly_confirmed
+        return new_words_to_send
+
+    def _try_n_word_match(self, n, words, words_clean, search_start, fallback=False):  # Deprecated
+        """Try to match the last n words from confirmed sequence"""
+        if len(self.confirmed_words) < n:
+            return 0
+
+        last_n = [strip_punctuation(w) for w in self.confirmed_words[-n:]]
+        # prefix = "[DEBUG FALLBACK]" if fallback else "[DEBUG]" # Verbose
+        # print(f"{prefix} Looking for last {n}: {last_n} in last 20 words: {words_clean[search_start:]}")
+
+        search_limit = len(words_clean) - n + 1
+        for i in range(search_start, search_limit):
+            if n == 1:
+                # Special case for single word matching
+                # Use words[i] for words_match_flexible as it expects original punctuation
+                if words_match_flexible(self.confirmed_words[-1], words[i]): # Compare original last confirmed with current original
+                    # print(f"{prefix} Found {n}-word match at position {i}, start_index = {i + 1}") # Verbose
+                    return i + 1 # Return index in `words` array for next word
+            else:
+                # Multi-word sequence matching
+                # Pass original `words` to sequence_matches_flexible
+                if sequence_matches_flexible(self.confirmed_words[-n:], words, i):
+                    # print(f"{prefix} Found {n}-word match at position {i}, start_index = {i + n}") # Verbose
+                    return i + n # Return index in `words` array for next word
+        return 0
+
+    def _try_fallback_matching(self, words, words_clean, search_start):
+        """Try matching by progressively removing words from the end of confirmed sequence"""
+        removed_words = []
+        min_words = getattr(self, 'min_confirmed_words', 4)
+
+        # Keep trying while we have more words than minimum
+        while len(self.confirmed_words) >= min_words:
+            # print(f"[DEBUG FALLBACK] Removing last confirmed word: '{self.confirmed_words[-1]}'") # Verbose
+
+            # Remove the last confirmed word
+            removed_words.append(self.confirmed_words.pop())
+            self.sent_words_count -= 1
+
+            # Try cascade: 4->3->2->1 words with remaining confirmed words
+            for n in [4, 3, 2, 1]:
+                start_index = self._try_n_word_match(n, words, words_clean, search_start, fallback=True)
+                if start_index > 0:
+                    # print(f"[DEBUG FALLBACK] Found match after removing {len(removed_words)} word(s)") # Verbose
+                    return start_index
+
+        # No match found, restore all removed words
+        # print(f"[DEBUG FALLBACK] No match found, restoring {len(removed_words)} removed word(s)") # Verbose
+        while removed_words:
+            self.confirmed_words.append(removed_words.pop())
+            self.sent_words_count += 1
+
+        return 0
 
     def get_debug_info(self):
-        potential_words = []
-        sorted_states = sorted(self.word_states.values(), key=lambda s: s.last_seen, reverse=True)
-        for state in sorted_states:
-            if not state.should_graduate(self.grad_threshold) and state.frequency >= 2:
-                potential_words.append(f"{state.latest_form}({state.frequency})")
-            if len(potential_words) >= 5:
+        confirmed_words_debug = []
+        potential_words_debug = []
+
+        # Create a list of (frequency, word_state) for sorting
+        sorted_states = sorted(self.word_states.values(), key=lambda ws: ws.frequency, reverse=True)
+
+        for word_state in sorted_states:
+            context_str = f"[{word_state.prev_word or ''}-{word_state.next_word or ''}]"
+            debug_str = f"{word_state.latest_form}({word_state.frequency}){context_str}"
+            if word_state.state == "confirmed" and len(confirmed_words_debug) < 5:
+                confirmed_words_debug.append(debug_str)
+            elif word_state.state == "potential" and len(potential_words_debug) < 5:
+                potential_words_debug.append(debug_str)
+            if len(confirmed_words_debug) >=5 and len(potential_words_debug) >=5:
                 break
-        return {"potential_words": potential_words}
-    return word_to_num.get(word.lower(), word)
 
-
-def normalize_word_for_matching(word):
-    """Normalize word for matching, converting number words to digits and handling currency"""
-    # Remove punctuation and convert to lowercase
-    clean = strip_punctuation(word)
-
-    # Convert word numbers to digits
-    converted = word_to_number(clean)
-
-    return converted
-
-
-def extract_number_prefix(word):
-    """Extract the number portion from a word for flexible number matching"""
-    # Match currency symbols, numbers, and common prefixes from original word (before strip_punctuation)
-    match = re.match(r'([£$€¥₹]?\\d+)', word.lower())
-    return match.group(1) if match else word.lower()
-
-
-def convert_currency_sequence(words, index):
-    """Convert sequences like 'three dollars' to '$3' """
-    if index < len(words) - 1:
-        current = normalize_word_for_matching(words[index])
-        next_word = normalize_word_for_matching(words[index + 1])
-
-        # Check if current is a number and next is currency
-        if current.isdigit() and next_word in ['dollar', 'dollars', 'pound', 'pounds', 'euro', 'euros']:
-            if next_word in ['dollar', 'dollars']:
-                return f"${current}"
-            elif next_word in ['pound', 'pounds']:
-                return f"£{current}"
-            elif next_word in ['euro', 'euros']:
-                return f"€{current}"
-
-    return normalize_word_for_matching(words[index])
+        return {
+            "last_5_confirmed": confirmed_words_debug,
+            "potential_words": potential_words_debug
+        }
 
 
 def words_match_flexible(word1, word2):
