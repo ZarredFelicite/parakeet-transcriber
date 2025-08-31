@@ -110,7 +110,7 @@ class WordState:
         return self.word_clean
 
     def _update_state(self):
-        if self.frequency >= 3:  # Reduced from 4 to 3 for faster confirmation
+        if self.frequency >= 4:  # Use 4 for stable punctuation
             self.state = "confirmed"
         elif self.frequency >= 2:
             self.state = "potential"
@@ -145,9 +145,9 @@ class TranscriptionTracker:
             word_key = word_state.get_key()
 
             if word_key in self.word_states:
-                # Only increment if not already confirmed (to stop counting at 3)
+                # Only increment if not already confirmed (to stop counting at 4)
                 existing_state = self.word_states[word_key]
-                if existing_state.frequency < 3:
+                if existing_state.frequency < 4:
                     existing_state.increment_frequency(word)
                 else:
                     # Update latest form but don't increment frequency
@@ -203,7 +203,7 @@ class TranscriptionTracker:
                 else:
                     # Stop at first non-graduated word to maintain order
                     if verbose:
-                        print(f"[GRAD] Stopped at '{word}' (freq={word_state.frequency}/3)")
+                        print(f"[GRAD] Stopped at '{word}' (freq={word_state.frequency}/4)")
                     break
             else:
                 # Word not found, stop graduation
