@@ -216,8 +216,16 @@ class TranscriptionTracker:
             if word_key in self.word_states:
                 word_state = self.word_states[word_key]
                 if word_state.should_graduate():
-                    # This word can be graduated - use latest punctuation form
+                    # Check for immediate duplicate before sending
                     output_word = word_state.get_output_word()
+                    
+                    # Skip if this would create an immediate duplicate
+                    if (self.confirmed_words and 
+                        normalize_word_for_matching(self.confirmed_words[-1]) == normalize_word_for_matching(output_word)):
+                        if verbose:
+                            print(f"[GRAD] Skipped duplicate '{output_word}' (same as last confirmed word)")
+                        continue
+                    
                     self.confirmed_words.append(output_word)
                     new_words_to_send.append(output_word)
                     self.sent_words_count += 1
