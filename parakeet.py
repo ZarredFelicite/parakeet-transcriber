@@ -140,9 +140,16 @@ class TranscriptionTracker:
         new_words_to_send = []
 
         # Update word frequencies using normalized keys (simplified for stability)
+        # Only count ONE occurrence per transcription round, even if word appears multiple times
+        words_seen_this_round = set()
         for word in words:
             word_state = WordState(word)
             word_key = word_state.get_key()
+            
+            # Skip if we already processed this word in this transcription round
+            if word_key in words_seen_this_round:
+                continue
+            words_seen_this_round.add(word_key)
 
             if word_key in self.word_states:
                 # Only increment if not already confirmed (to stop counting at 4)
