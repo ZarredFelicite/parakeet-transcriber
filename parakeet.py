@@ -31,24 +31,15 @@ from pydub import AudioSegment
 
 # --- Disable tqdm progress bars globally (NeMo transcribe uses tqdm) ---
 # This prevents the persistent "Transcribing: 100%|" bars from cluttering stdout.
-# We both set the environment variable and monkey-patch as a fallback.
+# Use environment variables only to avoid monkey-patching recursion issues.
 import os as _os
 _os.environ.setdefault("TQDM_DISABLE", "1")
 _os.environ.setdefault("DISABLE_NEMO_PROGRESS_BAR", "1")
-try:
-    from tqdm import tqdm as _tqdm
-    from functools import partialmethod as _partialmethod
-    # More aggressive tqdm disabling
-    _tqdm.__init__ = _partialmethod(_tqdm.__init__, disable=True)
-    _tqdm.__new__ = lambda cls, *args, **kwargs: _tqdm(*args, **dict(kwargs, disable=True))
-except Exception as _e:
-    print(f"[Init] tqdm disable patch failed: {_e}")
 
 # Additional progress bar suppression
 try:
     import sys
     from io import StringIO
-    # Redirect stderr temporarily during model loading to suppress progress bars
     _original_stderr = sys.stderr
     def _suppress_progress_bars():
         sys.stderr = StringIO()
