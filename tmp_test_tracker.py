@@ -104,17 +104,52 @@ class TranscriptionTracker:
         self.current_round = 0
         self.min_frequency = min_frequency
         self.min_consecutive_rounds = min_consecutive_rounds
+        
+        # Context-aware tracking
+        self.context_window = 2  # How many words of context to use
+        self.use_context_aware = True  # Enable context-aware tracking
+
+    def _get_context(self, words, position):
+        """Get context for a word at given position."""
+        if not self.use_context_aware:
+            return None
+            
+        context = []
+        
+        # Add previous words (up to context_window)
+        for i in range(max(0, position - self.context_window), position):
+            context.append(words[i] if i < len(words) else None)
+        
+        # Add the word itself
+        context.append(words[position] if position < len(words) else None)
+        
+        # Add next words (up to 1 for now)
+        for i in range(position + 1, min(len(words), position + 2)):
+            context.append(words[i] if i < len(words) else None)
+        
+        # Pad with None if needed to maintain consistent context size
+        while len(context) < self.context_window + 2:  # prev + word + next
+            context.append(None)
+        
+        return context
 
     def process_transcription(self, words, verbose=False):
         new_words_to_send = []
         self.current_round += 1
         words_seen_this_round = set()
         for i, word in enumerate(words):
-            curr_word = normalize_word_for_matching(word)
-            if curr_word in words_seen_this_round:
-                continue
-            words_seen_this_round.add(curr_word)
-            word_key = curr_word
+            # Get context for this word
+            context = self._get_context(words, i)
+            
+            # Create context-aware key
+            if self.use_context_aware and context is not None:
+                word_key = f"{normalize_word_for_matching(word)}@{'-'.join([normalize_word_for_matching(w) if w else '_' for w in context])}"
+            else:
+                word_key = normalize_word_for_matching(word)
+            
+            if word_key in words_seen_this_round:
+                continue  # count each unique contextual word once per round
+            words_seen_this_round.add(word_key)
             if word_key in self.word_states:
                 existing_state = self.word_states[word_key]
                 if existing_state.frequency < self.min_frequency:
@@ -199,7 +234,15 @@ class TranscriptionTracker:
             print(f"[GRAD] Starting from index {start_index}, confirmed_words: {len(self.confirmed_words)}")
         for i in range(start_index, len(words)):
             word = words[i]
-            word_key = normalize_word_for_matching(word)
+            
+            # Get context for this word in graduation phase
+            context = self._get_context(words, i)
+            
+            # Create context-aware key for graduation
+            if self.use_context_aware and context is not None:
+                word_key = f"{normalize_word_for_matching(word)}@{'-'.join([normalize_word_for_matching(w) if w else '_' for w in context])}"
+            else:
+                word_key = normalize_word_for_matching(word)
             expected_index = len(self.confirmed_words)
             # Allow small position drifts due to ASR transcript instability
             position_tolerance = 1

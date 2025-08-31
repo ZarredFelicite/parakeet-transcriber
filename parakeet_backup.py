@@ -31,23 +31,15 @@ from pydub import AudioSegment
 
 # --- Disable tqdm progress bars globally (NeMo transcribe uses tqdm) ---
 # This prevents the persistent "Transcribing: 100%|" bars from cluttering stdout.
-# Use environment variables only to avoid monkey-patching recursion issues.
+# We both set the environment variable and monkey-patch as a fallback.
 import os as _os
 _os.environ.setdefault("TQDM_DISABLE", "1")
-_os.environ.setdefault("DISABLE_NEMO_PROGRESS_BAR", "1")
-
-# Additional progress bar suppression
 try:
-    import sys
-    from io import StringIO
-    _original_stderr = sys.stderr
-    def _suppress_progress_bars():
-        sys.stderr = StringIO()
-    def _restore_stderr():
-        sys.stderr = _original_stderr
-except Exception:
-    def _suppress_progress_bars(): pass
-    def _restore_stderr(): pass
+    from tqdm import tqdm as _tqdm
+    from functools import partialmethod as _partialmethod
+    _tqdm.__init__ = _partialmethod(_tqdm.__init__, disable=True)
+except Exception as _e:
+    print(f"[Init] tqdm disable patch failed: {_e}")
 
 # Global variable for the ASR model
 ASR_MODEL = None
@@ -90,454 +82,129 @@ def normalize_word_for_matching(word):
 
 
 class WordState:
-    def __init__(self, word, frequency=1, initial_round=None):
+    def __init__(self, word, prev_word=None, next_word=None, frequency=1):
         self.word = word  # Original word with punctuation
-        self.word_clean = normalize_word_for_matching(word)  # Normalized for robust matching
+        self.word_clean = strip_punctuation(word)  # Clean word for matching
+        self.prev_word = strip_punctuation(prev_word) if prev_word else None
+        self.next_word = strip_punctuation(next_word) if next_word else None
         self.frequency = frequency
         self.state = "unconfirmed"  # "unconfirmed", "potential", "confirmed"
         self.first_seen = time.time()
         self.last_seen = time.time()
         self.latest_form = word  # Track latest punctuation variant
 
-        # Round-based tracking to require consecutive observations
-        # - last_seen_round: the round id where this word was last observed
-        # - seen_in_row: number of consecutive rounds the word has been observed
-        # - last_seen_pos: the token index where the word was last observed (for position consistency)
-        # - pos_consistent_in_row: number of consecutive rounds the word has been observed at approximately the same position
-        self.last_seen_round = None if initial_round is None else initial_round
-        self.seen_in_row = 1 if initial_round is not None else 0
-        self.last_seen_pos = None
-        self.pos_consistent_in_row = 0
-
-    def increment_frequency(self, word_variant, current_round=None, current_pos=None, pos_tolerance=1):
-        """Increment frequency for this word and update consecutive-round and position-consistency counters.
-
-        Parameters
-        ----------
-        word_variant : str
-            The original word form observed (may contain punctuation/capitalization).
-        current_round : int|None
-            The integer id of the current transcription round. If provided, updates
-            the seen_in_row counter (consecutive rounds seen); otherwise only
-            frequency and timestamps are updated.
-        current_pos : int|None
-            The index position within the current transcription where the word was observed.
-        pos_tolerance : int
-            How far (in token positions) an observation can drift and still count as position-consistent.
-        """
-        # Increment global frequency (capped externally by the tracker if desired)
+    def increment_frequency(self, word_variant):
         self.frequency += 1
         self.last_seen = time.time()
+        self.latest_form = word_variant  # Update to latest punctuation form
+        self._update_state()
 
-        # Update consecutive-round counters
-        if current_round is not None:
-            if self.last_seen_round is None:
-                # First time we learn about the round
-                self.seen_in_row = 1
-            elif current_round == self.last_seen_round:
-                # Same round observed multiple times (we count words once per round)
-                # do not increment seen_in_row further
-                pass
-            elif current_round == self.last_seen_round + 1:
-                # Observed in consecutive round
-                self.seen_in_row += 1
-            else:
-                # Not consecutive - reset consecutive counter
-                self.seen_in_row = 1
-            self.last_seen_round = current_round
+    def get_context_key(self):
+        """Return a key that includes word and context for uniqueness"""
+        # Include the original word to prevent context collisions
+        return (self.word_clean, self.prev_word, self.next_word, self.word)
 
-        # Update positional consistency
-        if current_pos is not None:
-            if self.last_seen_pos is None:
-                self.pos_consistent_in_row = 1
-            else:
-                # If this observation is near the previous observed position, count as consistent
-                if abs(current_pos - self.last_seen_pos) <= pos_tolerance:
-                    # If the round is consecutive (or same), increment pos_consistent_in_row
-                    if current_round is None or self.last_seen_round is None or current_round == self.last_seen_round or current_round == self.last_seen_round + 1:
-                        self.pos_consistent_in_row += 1
-                    else:
-                        # Position consistent but not consecutive round -> reset to 1
-                        self.pos_consistent_in_row = 1
-                else:
-                    # Position drifted too far -> reset
-                    self.pos_consistent_in_row = 1
-            self.last_seen_pos = current_pos
-
-    def get_key(self, context=None):
-        """Return normalized word as key, optionally with context"""
-        if context is None:
-            return self.word_clean
+    def _update_state(self):
+        if self.frequency >= 4:
+            self.state = "confirmed"
+        elif self.frequency >= 2:
+            self.state = "potential"
         else:
-            # Create context-aware key: word@prev1-prev2-word-next1
-            context_parts = []
-            for word in context:
-                if word is None:
-                    context_parts.append("_")
-                else:
-                    context_parts.append(normalize_word_for_matching(word))
-            return f"{self.word_clean}@{'-'.join(context_parts)}"
+            self.state = "unconfirmed"
 
-    def should_graduate(self, min_frequency=4, min_consecutive=2, require_pos_consistency=False, min_pos_consistent=1, confirmed_words=None):
-        """Decide whether this word should be considered confirmed.
-
-        We require BOTH a minimum total frequency and a minimum number of
-        consecutive rounds observed to avoid intermittent words graduating.
-
-        Optionally, require position-consistency (observed near the same token
-        index across rounds) by setting require_pos_consistency=True.
-        
-        For repeated words that have already been confirmed, we relax the
-        positional consistency requirement to prevent blocking.
-        """
-        freq_ok = self.frequency >= min_frequency
-        consec_ok = self.seen_in_row >= min_consecutive
-        if not require_pos_consistency:
-            return freq_ok and consec_ok
-        else:
-            pos_ok = self.pos_consistent_in_row >= min_pos_consistent
-            
-            # Special handling for repeated words: if this word has already been
-            # confirmed before, relax the positional consistency requirement
-            if not pos_ok and confirmed_words is not None:
-                word_already_confirmed = any(
-                    normalize_word_for_matching(confirmed_word) == self.word_clean 
-                    for confirmed_word in confirmed_words
-                )
-                if word_already_confirmed and freq_ok and consec_ok:
-                    # For repeated words, only require basic frequency and consecutive observation
-                    return True
-            
-            return freq_ok and consec_ok and pos_ok
+    def should_graduate(self):
+        return self.state == "confirmed"
 
     def get_output_word(self):
         """Return the word form to output (with latest punctuation)"""
         return self.latest_form
 
     def __str__(self):
-        return f"{self.latest_form}({self.frequency}:{self.state}/r{self.seen_in_row})"
+        context = f"[{self.prev_word or ''}-{self.next_word or ''}]"
+        return f"{self.latest_form}({self.frequency}:{self.state}){context}"
 
 
 class TranscriptionTracker:
-    def __init__(self, min_confirmed_words=4, min_frequency=4, min_consecutive_rounds=2):
-        self.word_states = {}  # normalized_word -> WordState (back to simple keys for stability)
-        self.confirmed_words = []  # Simple list of confirmed words
+    def __init__(self, min_confirmed_words=4):
+        self.word_states = {}  # context_key -> WordState
+        self.confirmed_words = []  # Simple list of confirmed words (no context)
         self.sent_words_count = 0
         self.min_confirmed_words = min_confirmed_words  # Stop removing words when we reach this many
-        self.last_start_index = 0  # Track last start_index to prevent large backtracks
-        self.stall_count = 0  # Track how many rounds we've been stuck at the same position
-        self.stall_threshold = 10  # Force more aggressive alignment after this many stalls
-
-        # Round tracking: each call to process_transcription increments the round_id
-        # so we can track consecutive rounds a word appears in.
-        self.current_round = 0
-
-        # Confirmation thresholds
-        self.min_frequency = min_frequency
-        self.min_consecutive_rounds = min_consecutive_rounds
-        
-        # Context-aware tracking
-        self.context_window = 2  # How many words of context to use
-        self.use_context_aware = True  # Enable context-aware tracking
-
-    def _get_context(self, words, position):
-        """Get context for a word at given position."""
-        if not self.use_context_aware:
-            return None
-            
-        context = []
-        
-        # Add previous words (up to context_window)
-        for i in range(max(0, position - self.context_window), position):
-            context.append(words[i] if i < len(words) else None)
-        
-        # Add the word itself
-        context.append(words[position] if position < len(words) else None)
-        
-        # Add next words (up to 1 for now)
-        for i in range(position + 1, min(len(words), position + 2)):
-            context.append(words[i] if i < len(words) else None)
-        
-        # Pad with None if needed to maintain consistent context size
-        while len(context) < self.context_window + 2:  # prev + word + next
-            context.append(None)
-        
-        return context
 
     def process_transcription(self, words, verbose=False):
-        """Update internal state from a full transcription pass and return newly confirmed words.
-
-        Instrumented with detailed alignment + graduation diagnostics when verbose=True.
-        """
         new_words_to_send = []
 
-        # Start a new round
-        self.current_round += 1
-        round_id = self.current_round
-
-        # -----------------------------
-        # 1. Update word observations
-        # -----------------------------
-        words_seen_this_round = set()
+        # Update word frequencies using context-aware keys
         for i, word in enumerate(words):
-            # Get context for this word
-            context = self._get_context(words, i)
-            
-            # Create context-aware key
-            if self.use_context_aware and context is not None:
-                word_key = f"{normalize_word_for_matching(word)}@{'-'.join([normalize_word_for_matching(w) if w else '_' for w in context])}"
-            else:
-                word_key = normalize_word_for_matching(word)
-            
-            if word_key in words_seen_this_round:
-                continue  # count each unique contextual word once per round
-            words_seen_this_round.add(word_key)
-            state = self.word_states.get(word_key)
-            if state is not None:
-                if state.frequency < self.min_frequency:
-                    state.increment_frequency(word, current_round=round_id, current_pos=i)
+            prev_word = words[i-1] if i > 0 else None
+            next_word = words[i+1] if i < len(words)-1 else None
+
+            word_state = WordState(word, prev_word, next_word)
+            context_key = word_state.get_context_key()
+
+            if context_key in self.word_states:
+                # Only increment if not already confirmed (to stop counting at 4)
+                existing_state = self.word_states[context_key]
+                if existing_state.frequency < 4:
+                    existing_state.increment_frequency(word)
                 else:
-                    # At/above cap: still update recency + positional consistency
-                    state.latest_form = word
-                    if state.last_seen_round != round_id:
-                        prev_round = state.last_seen_round
-                        state.last_seen_round = round_id
-                        if prev_round is None or round_id == prev_round + 1:
-                            state.seen_in_row = state.seen_in_row + 1 if state.seen_in_row else 1
-                        else:
-                            state.seen_in_row = 1
-                    if state.last_seen_pos is None:
-                        state.last_seen_pos = i
-                        state.pos_consistent_in_row = 1
-                    else:
-                        if abs(i - state.last_seen_pos) <= 1:
-                            state.pos_consistent_in_row += 1
-                        else:
-                            state.pos_consistent_in_row = 1
-                        state.last_seen_pos = i
+                    # Update latest form but don't increment frequency
+                    existing_state.latest_form = word
             else:
-                # New contextual word
-                state = WordState(word, frequency=1, initial_round=round_id)
-                state.last_seen_pos = i
-                state.pos_consistent_in_row = 1
-                self.word_states[word_key] = state
+                self.word_states[context_key] = word_state
 
-            # State graduation phases (unconfirmed -> potential) purely for debug visualization
-            if state.state == "unconfirmed" and state.frequency >= max(2, self.min_frequency // 2):
-                state.state = "potential"
-
-        # -----------------------------
-        # 2. Alignment (determine start_index)
-        # -----------------------------
+        # Find where our confirmed sequence ends in the current transcription
         start_index = 0
-        words_normalized = [normalize_word_for_matching(w) for w in words]
+        words_clean = [strip_punctuation(w) for w in words]
+
+        # Search only in the last 20 words to avoid duplicate sequence matches
+        search_start = max(0, len(words_clean) - 20)
+
+        # Efficient prefix alignment: find the longest prefix of current words
+        # that exactly equals the tail of confirmed_words. This prevents re-sending
+        # previously confirmed words while avoiding complex fuzzy matching.
         if self.confirmed_words:
             max_overlap = min(len(self.confirmed_words), len(words))
-            if verbose:
-                print(f"[ALIGN] Confirmed={len(self.confirmed_words)} Incoming={len(words)} MaxOverlap={max_overlap}")
+            start_index = 0
             for overlap in range(max_overlap, 0, -1):
-                tail = [normalize_word_for_matching(w) for w in self.confirmed_words[-overlap:]]
-                head = words_normalized[:overlap]
-                if verbose:
-                    match_flag = '✓' if tail == head else '✗'
-                    print(f"[ALIGN] OverlapTest k={overlap}: tail={' '.join(tail)} | head={' '.join(head)} -> {match_flag}")
+                tail = [strip_punctuation(w) for w in self.confirmed_words[-overlap:]]
+                head = [strip_punctuation(w) for w in words[:overlap]]
                 if tail == head:
                     start_index = overlap
-                    if verbose:
-                        print(f"[ALIGN] ExactPrefixMatch size={overlap} -> start_index={start_index}")
                     break
-
-        min_allowed_start = len(self.confirmed_words)
-        if start_index < min_allowed_start:
-            found_partial_alignment = False
-            best_forward_candidate = None  # (potential_start, lookback, i)
-            best_backward_candidate = None  # closest (highest) potential_start < min_allowed_start
-            if self.confirmed_words and words:
-                max_lookback = min(5, len(self.confirmed_words))
-                for lookback in range(max_lookback, 0, -1):
-                    last_seq = [normalize_word_for_matching(w) for w in self.confirmed_words[-lookback:]]
-                    if verbose:
-                        print(f"[ALIGN] PartialSearch lookback={lookback} seq={' '.join(last_seq)}")
-                    for i in range(len(words) - lookback + 1):
-                        slice_seq = words_normalized[i:i+lookback]
-                        if last_seq == slice_seq:
-                            potential_start = i + lookback
-                            max_backtrack = min(10, len(self.confirmed_words) // 2)
-                            allowed_floor = len(self.confirmed_words) - max_backtrack
-                            if verbose:
-                                print(f"[ALIGN]  Candidate at i={i} -> potential_start={potential_start} allowed_floor={allowed_floor}")
-                            # Track forward and backward separately; we will pick the safest after search
-                            if potential_start >= min_allowed_start:
-                                # Forward (or exact) continuation. Prefer the SMALLEST forward jump.
-                                if best_forward_candidate is None or potential_start < best_forward_candidate[0]:
-                                    best_forward_candidate = (potential_start, lookback, i)
-                            else:
-                                # Backward (some rollback). Prefer the LARGEST potential_start (minimal rollback) >= allowed_floor
-                                if potential_start >= allowed_floor:
-                                    if best_backward_candidate is None or potential_start > best_backward_candidate[0]:
-                                        best_backward_candidate = (potential_start, lookback, i)
-                # Decide which candidate to use
-                chosen = None
-                if best_forward_candidate is not None:
-                    potential_start, lookback, i = best_forward_candidate
-                    # Disallow forward jumps larger than +1 to prevent skipping unseen tokens
-                    if potential_start > min_allowed_start + 1:
-                        if verbose:
-                            print(f"[ALIGN]  Forward candidate would skip tokens (potential_start={potential_start} > {min_allowed_start}+1). Clamping to {min_allowed_start}.")
-                        start_index = min_allowed_start
-                    else:
-                        start_index = potential_start
-                        chosen = ('forward', best_forward_candidate)
-                elif best_backward_candidate is not None:
-                    potential_start, lookback, i = best_backward_candidate
-                    start_index = potential_start
-                    chosen = ('backward', best_backward_candidate)
-                if verbose:
-                    if chosen:
-                        direction, data = chosen
-                        ps, lb, idx = data
-                        print(f"[ALIGN]  Selected {direction} candidate start_index={start_index} (lookback={lb} at i={idx})")
-                    else:
-                        print(f"[ALIGN]  No suitable partial candidate found")
-                found_partial_alignment = chosen is not None
-            if not found_partial_alignment:
-                if verbose:
-                    print(f"[ALIGN] Fallback boundary correction {start_index}->{min_allowed_start}")
-                start_index = min_allowed_start
-
-        # Final safety: never allow forward skip beyond current confirmed length
-        if start_index > len(self.confirmed_words):
-            if verbose:
-                print(f"[ALIGN] Safety clamp forward start_index {start_index}->{len(self.confirmed_words)}")
-            start_index = len(self.confirmed_words)
-
-        # Track alignment stalls FIRST
-        if start_index == self.last_start_index:
-            self.stall_count += 1
         else:
-            self.stall_count = 0
-        
-        # Check if we're in a stall situation and need to force progress
-        if self.stall_count >= self.stall_threshold:
-            # Force more aggressive alignment to break the stall
-            if verbose:
-                print(f"[ALIGN] Stall detected ({self.stall_count} rounds), forcing alignment forward by 1")
-            start_index = min(start_index + 1, len(self.confirmed_words))
-            self.stall_count = 0  # Reset stall counter after forcing alignment
-        
-        self.last_start_index = start_index
+            start_index = 0
 
-        # -----------------------------
-        # 2.5. Rollback mechanism for dropped words
-        # -----------------------------
-        # If we have confirmed words but the ASR transcript is missing expected words,
-        # we may need to rollback some confirmed words to maintain alignment
-        if self.confirmed_words and start_index < len(self.confirmed_words):
-            words_to_rollback = len(self.confirmed_words) - start_index
-            if words_to_rollback > 0 and words_to_rollback <= 3:  # Only rollback a few words
-                if verbose:
-                    print(f"[ROLLBACK] ASR appears to have dropped {words_to_rollback} words. Rolling back confirmed words from {len(self.confirmed_words)} to {start_index}")
-                # Move rolled-back words back to unconfirmed state
-                for _ in range(words_to_rollback):
-                    if self.confirmed_words:
-                        rolled_back_word = self.confirmed_words.pop()
-                        norm = normalize_word_for_matching(rolled_back_word)
-                        if norm in self.word_states:
-                            self.word_states[norm].state = "unconfirmed"
-                            if verbose:
-                                print(f"[ROLLBACK] Moved '{rolled_back_word}' back to unconfirmed state")
-
-        # -----------------------------
-        # 3. Graduation (monotonic sequence extension)
-        # -----------------------------
+        # Graduate words in strict sequential order from where confirmed sequence ends
         if verbose:
-            print(f"[GRAD] Begin start_index={start_index} confirmed_len={len(self.confirmed_words)}")
+            print(f"[GRAD] Starting from index {start_index}, confirmed_words: {len(self.confirmed_words)}")
         for i in range(start_index, len(words)):
             word = words[i]
-            norm = normalize_word_for_matching(word)
-            expected_index = len(self.confirmed_words)
+            prev_word = words[i-1] if i > 0 else None
+            next_word = words[i+1] if i < len(words)-1 else None
 
-            # Allow small position drifts due to ASR transcript instability
-            position_tolerance = 1
-            if abs(i - expected_index) > position_tolerance:
-                if verbose:
-                    reason = 'backtrack' if i < expected_index else 'forward drift'
-                    print(f"[GRAD] Abort: token_index {i} != expected {expected_index} ({reason})")
-                break
-            elif i != expected_index:
-                if verbose:
-                    drift_direction = 'behind' if i < expected_index else 'ahead'
-                    print(f"[GRAD] Small position drift: token index {i} vs expected {expected_index} ({drift_direction}). Allowing with tolerance.")
-                # Continue with current position - the graduation logic will handle it
+            # Create context key for this specific word instance
+            temp_word_state = WordState(word, prev_word, next_word)
+            context_key = temp_word_state.get_context_key()
 
-            # Get context for this word in graduation phase
-            context = self._get_context(words, i)
-            
-            # Create context-aware key for graduation
-            if self.use_context_aware and context is not None:
-                word_key = f"{normalize_word_for_matching(word)}@{'-'.join([normalize_word_for_matching(w) if w else '_' for w in context])}"
-            else:
-                word_key = normalize_word_for_matching(word)
-            
-            state = self.word_states.get(word_key)
-            if state is None:
-                if verbose:
-                    print(f"[GRAD] Stop: '{word}' unseen contextual state (key={word_key})")
-                break
-
-            # Sanity: ensure alignment didn't skip an expected next token from raw transcript
-            if expected_index > 0:
-                prev_confirmed_norm = normalize_word_for_matching(self.confirmed_words[-1])
-                if i > 0:
-                    prev_raw_norm = normalize_word_for_matching(words[i-1])
-                    if prev_raw_norm != prev_confirmed_norm and verbose:
-                        print(f"[GRAD] Warning: preceding raw token '{words[i-1]}' (norm={prev_raw_norm}) != last confirmed '{self.confirmed_words[-1]}' (norm={prev_confirmed_norm})")
-
-            require_pos = True
-            min_pos_consistent = 2
-            can_graduate = state.should_graduate(
-                min_frequency=self.min_frequency,
-                min_consecutive=self.min_consecutive_rounds,
-                require_pos_consistency=require_pos,
-                min_pos_consistent=min_pos_consistent,
-                confirmed_words=self.confirmed_words
-            )
-
-            if verbose:
-                print(f"[GRAD] Eval '{word}': idx={i} expected={expected_index} freq={state.frequency}/{self.min_frequency} consec={state.seen_in_row}/{self.min_consecutive_rounds} pos_cons={state.pos_consistent_in_row}/{min_pos_consistent} last_seen_pos={state.last_seen_pos} last_start_index={self.last_start_index} -> {'GRAD' if can_graduate else 'HOLD'}")
-
-            if not can_graduate:
-                break
-
-            output_word = state.get_output_word()
-            if self.confirmed_words and normalize_word_for_matching(self.confirmed_words[-1]) == norm:
-                if verbose:
-                    print(f"[GRAD] Skip duplicate '{output_word}' (same as last confirmed)")
-                continue
-            # Check if this word is being seen at a position behind where we expect it
-            # But allow repeated words to graduate at their new position
-            if state.last_seen_pos is not None and state.last_seen_pos < self.last_start_index:
-                # Check if this is a repeated word that appears later in the transcript
-                word_already_confirmed = any(
-                    normalize_word_for_matching(confirmed_word) == norm 
-                    for confirmed_word in self.confirmed_words
-                )
-                if word_already_confirmed:
-                    # This is a repeated word appearing later - allow it to graduate
-                    if verbose:
-                        print(f"[GRAD] Allowing repeated word '{output_word}' to graduate at position {i} (previously at {state.last_seen_pos})")
+            if context_key in self.word_states:
+                word_state = self.word_states[context_key]
+                if word_state.should_graduate():
+                    # This word can be graduated - use latest punctuation form
+                    output_word = word_state.get_output_word()
+                    self.confirmed_words.append(output_word)
+                    new_words_to_send.append(output_word)
+                    self.sent_words_count += 1
                 else:
-                    # This is a word appearing out of order - skip it
+                    # Stop at first non-graduated word to maintain order
                     if verbose:
-                        print(f"[GRAD] Abort: '{output_word}' last_seen_pos {state.last_seen_pos} < last_start_index {self.last_start_index}")
+                        print(f"[GRAD] Stopped at '{word}' (freq={word_state.frequency}/4)")
                     break
-
-            self.confirmed_words.append(output_word)
-            state.state = "confirmed"
-            new_words_to_send.append(output_word)
-            self.sent_words_count += 1
-            if verbose:
-                print(f"[GRAD] ✅ Graduated '{output_word}' -> confirmed_len={len(self.confirmed_words)}")
+            else:
+                # Word context not found, stop graduation
+                if verbose:
+                    print(f"[GRAD] Stopped at '{word}' - not seen before")
+                break
 
         return new_words_to_send
 
@@ -602,7 +269,8 @@ class TranscriptionTracker:
         sorted_states = sorted(self.word_states.values(), key=lambda ws: ws.frequency, reverse=True)
 
         for word_state in sorted_states:
-            debug_str = f"{word_state.latest_form}({word_state.frequency})"
+            context_str = f"[{word_state.prev_word or ''}-{word_state.next_word or ''}]"
+            debug_str = f"{word_state.latest_form}({word_state.frequency}){context_str}"
             if word_state.state == "confirmed" and len(confirmed_words_debug) < 5:
                 confirmed_words_debug.append(debug_str)
             elif word_state.state == "potential" and len(potential_words_debug) < 5:
@@ -693,169 +361,207 @@ def sequence_matches_flexible(target_seq, words, start_pos):
     return True
 
 
+class WordState:
+    def __init__(self, word, prev_word=None, next_word=None, frequency=1):
+        self.word = word  # Original word with punctuation
+        self.word_clean = strip_punctuation(word)  # Clean word for matching
+        self.prev_word = strip_punctuation(prev_word) if prev_word else None
+        self.next_word = strip_punctuation(next_word) if next_word else None
+        self.frequency = frequency
+        self.state = "unconfirmed"  # "unconfirmed", "potential", "confirmed"
+        self.first_seen = time.time()
+        self.last_seen = time.time()
+        self.latest_form = word  # Track latest punctuation variant
 
+    def increment_frequency(self, word_variant):
+        self.frequency += 1
+        self.last_seen = time.time()
+        self.latest_form = word_variant  # Update to latest punctuation form
+        self._update_state()
 
-def simulate_streaming_transcription(audio_path: str, batch_words: list, chunk_duration_ms: int = 250, verbose: bool = False):
-    """
-    Simulate streaming transcription by processing audio in chunks like the WebSocket endpoint.
-    Stops as soon as the streaming result diverges from the batch transcription.
-    Returns (streaming_result, divergence_info).
-    """
-    asr_model = load_model()
-    
-    # Load and prepare audio
-    audio = AudioSegment.from_file(audio_path)
-    if audio.channels > 1:
-        audio = audio.set_channels(1)
-    if audio.frame_rate != 16000:
-        audio = audio.set_frame_rate(16000)
-    
-    # Convert to raw bytes
-    sample_rate = 16000
-    sample_width = 2
-    channels = 1
-    window_size_seconds = 15
-    min_audio_len_seconds = 3
-    min_audio_len_bytes = min_audio_len_seconds * sample_rate * sample_width * channels
-    window_size_bytes = window_size_seconds * sample_rate * sample_width * channels
-    
-    # Simulate streaming by processing chunks
-    buffer = bytearray()
-    tracker = TranscriptionTracker()
-    streaming_result = []
-    is_initial_transcription = True
-    
-    # Process audio in chunks
-    total_length_ms = len(audio)
-    chunk_size_ms = chunk_duration_ms
-    divergence_info = None
-    
-    print(f"[STREAM-TEST] Simulating streaming with {chunk_size_ms}ms chunks")
-    print(f"[STREAM-TEST] Total audio: {total_length_ms/1000:.2f}s")
-    print(f"[STREAM-TEST] Target batch result: {' '.join(batch_words[:10])}{'...' if len(batch_words) > 10 else ''}")
-    
-    for chunk_start in range(0, total_length_ms, chunk_size_ms):
-        chunk_end = min(chunk_start + chunk_size_ms, total_length_ms)
-        chunk = audio[chunk_start:chunk_end]
-        
-        # Convert chunk to bytes and add to buffer
-        chunk_bytes = chunk.raw_data
-        buffer.extend(chunk_bytes)
-        
-        # Determine if we should transcribe
-        should_transcribe = False
-        if is_initial_transcription:
-            if len(buffer) >= min_audio_len_bytes:
-                should_transcribe = True
-                is_initial_transcription = False
+    def get_context_key(self):
+        """Return a key that includes word and context for uniqueness"""
+        # Include the original word to prevent context collisions
+        return (self.word_clean, self.prev_word, self.next_word, self.word)
+
+    def _update_state(self):
+        if self.frequency >= 4:
+            self.state = "confirmed"
+        elif self.frequency >= 2:
+            self.state = "potential"
         else:
-            should_transcribe = True
-        
-        if should_transcribe:
-            # Convert buffer to AudioSegment for transcription
-            audio_segment = AudioSegment(data=buffer, sample_width=sample_width, frame_rate=sample_rate, channels=channels)
-            
-            # Transcribe
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmpfile:
-                temp_wav_file_path = tmpfile.name
-                audio_segment.export(temp_wav_file_path, format="wav")
-            
-            try:
-                # Suppress progress bars during transcription
-                _suppress_progress_bars()
-                transcription_result = asr_model.transcribe([temp_wav_file_path])
-                _restore_stderr()
-                current_words = transcription_result[0].text.strip().split() if transcription_result and transcription_result[0].text else []
-                
-                # Process through tracker with compact visual output
-                new_words = tracker.process_transcription(current_words, verbose=False)
-                if new_words:
-                    streaming_result.extend(new_words)
-                
-                if verbose and current_words:
-                    chunk_num = chunk_start//chunk_size_ms
-                    # Create visual representation of word states
-                    visual_words = []
-                    confirmed_count = len(tracker.confirmed_words)
+            self.state = "unconfirmed"
 
-                    for i, word in enumerate(current_words):
-                        word_key = normalize_word_for_matching(word)
-                        is_align_point = (hasattr(tracker, 'last_start_index') and tracker.last_start_index > 0 and i == tracker.last_start_index)
+    def should_graduate(self):
+        return self.state == "confirmed"
 
-                        if is_align_point:
-                            # Alignment point - blue with |
-                            visual_words.append(f"\033[94m|{word}\033[0m")
-                        elif word_key in tracker.word_states:
-                            state = tracker.word_states[word_key]
-                            # Visualize positional consistency in the display
-                            pos_ok = state.pos_consistent_in_row >= 2
-                            if state.frequency >= tracker.min_frequency and pos_ok:
-                                # Graduated word - green with []
-                                visual_words.append(f"\033[92m[{word}]\033[0m")
-                            elif state.frequency >= max(2, tracker.min_frequency // 2):
-                                # Potential word - yellow with ()
-                                visual_words.append(f"\033[93m({word})\033[0m")
-                            else:
-                                # Unconfirmed - red
-                                visual_words.append(f"\033[91m{word}\033[0m")
-                        else:
-                            # New word - red
-                            visual_words.append(f"\033[91m{word}\033[0m")
+    def get_output_word(self):
+        """Return the word form to output (with latest punctuation)"""
+        return self.latest_form
 
-                    visual_text = ' '.join(visual_words)
-                    new_count = len(new_words) if new_words else 0
-                    print(f"[STREAM-TEST] Chunk {chunk_num}: +{new_count}→{len(streaming_result)} | {visual_text}")
-                
-                # Check for divergence after each chunk that produces words
-                if streaming_result:
-                    # Compare current streaming result with batch result using normalized matching
-                    for i, stream_word in enumerate(streaming_result):
-                        # Normalize both for robust comparison (strip punctuation, map number words)
-                        stream_norm = normalize_word_for_matching(stream_word)
-                        batch_norm = normalize_word_for_matching(batch_words[i]) if i < len(batch_words) else None
+    def __str__(self):
+        context = f"[{self.prev_word or ''}-{self.next_word or ''}]"
+        return f"{self.latest_form}({self.frequency}:{self.state}){context}"
 
-                        if i >= len(batch_words) or batch_norm is None or stream_norm != batch_norm:
-                            # If it's merely capitalization or punctuation differences, the normalization will match above
-                            # Also allow simple plural differences (e.g., word vs words)
-                            is_plural_difference = False
-                            if i < len(batch_words):
-                                sw = stream_norm or ""
-                                bw = batch_norm or ""
-                                if sw + 's' == bw or bw + 's' == sw:
-                                    is_plural_difference = True
 
-                            if is_plural_difference:
-                                continue
-                            else:
-                                # Real divergence - stop the test
-                                divergence_info = {
-                                    'position': i,
-                                    'chunk_time': chunk_end / 1000.0,
-                                    'streaming_words': len(streaming_result),
-                                    'batch_words': len(batch_words),
-                                    'stream_word': stream_word if i < len(streaming_result) else '[MISSING]',
-                                    'batch_word': batch_words[i] if i < len(batch_words) else '[MISSING]',
-                                    'streaming_result': streaming_result.copy(),
-                                    'raw_transcription': current_words.copy(),
-                                    'last_start_index': getattr(tracker, 'last_start_index', None),
-                                    'tracker_debug': tracker.get_debug_info()
-                                }
-                                print(f"[STREAM-TEST] 🚨 DIVERGENCE DETECTED at position {i} after {chunk_end/1000:.2f}s")
-                                print(f"[STREAM-TEST] Expected: '{batch_words[i] if i < len(batch_words) else '[MISSING]'}'")
-                                print(f"[STREAM-TEST] Got: '{stream_word if i < len(streaming_result) else '[MISSING]'}'")
-                                print(f"[STREAM-TEST] Tracker last_start_index={divergence_info['last_start_index']}")
-                                print(f"[STREAM-TEST] Tracker debug: {divergence_info['tracker_debug']}")
-                                return streaming_result, divergence_info
-                
-            finally:
-                os.remove(temp_wav_file_path)
-            
-            # Manage buffer size
-            if len(buffer) > window_size_bytes:
-                buffer = buffer[-window_size_bytes:]
-    
-    # If we get here, no divergence was found
-    return streaming_result, divergence_info
+class TranscriptionTracker:
+    def __init__(self, min_confirmed_words=4):
+        self.word_states = {}  # context_key -> WordState
+        self.confirmed_words = []  # Simple list of confirmed words (no context)
+        self.sent_words_count = 0
+        self.min_confirmed_words = min_confirmed_words  # Stop removing words when we reach this many
+
+    def process_transcription(self, words, verbose=False):
+        new_words_to_send = []
+
+        # Update word frequencies using context-aware keys
+        for i, word in enumerate(words):
+            prev_word = words[i-1] if i > 0 else None
+            next_word = words[i+1] if i < len(words)-1 else None
+
+            word_state = WordState(word, prev_word, next_word)
+            context_key = word_state.get_context_key()
+
+            if context_key in self.word_states:
+                # Only increment if not already confirmed (to stop counting at 4)
+                existing_state = self.word_states[context_key]
+                if existing_state.frequency < 4:
+                    existing_state.increment_frequency(word)
+                else:
+                    # Update latest form but don't increment frequency
+                    existing_state.latest_form = word
+            else:
+                self.word_states[context_key] = word_state
+
+        # Find where our confirmed sequence ends in the current transcription
+        start_index = 0
+        words_clean = [strip_punctuation(w) for w in words]
+
+        # Search only in the last 20 words to avoid duplicate sequence matches
+        search_start = max(0, len(words_clean) - 20)
+
+        # Efficient prefix alignment: find the longest prefix of current words
+        # that exactly equals the tail of confirmed_words. This prevents re-sending
+        # previously confirmed words while avoiding complex fuzzy matching.
+        if self.confirmed_words:
+            max_overlap = min(len(self.confirmed_words), len(words))
+            start_index = 0
+            for overlap in range(max_overlap, 0, -1):
+                tail = [strip_punctuation(w) for w in self.confirmed_words[-overlap:]]
+                head = [strip_punctuation(w) for w in words[:overlap]]
+                if tail == head:
+                    start_index = overlap
+                    break
+        else:
+            start_index = 0
+
+        # Graduate words in strict sequential order from where confirmed sequence ends
+        if verbose:
+            print(f"[GRAD] Starting from index {start_index}, confirmed_words: {len(self.confirmed_words)}")
+        for i in range(start_index, len(words)):
+            word = words[i]
+            prev_word = words[i-1] if i > 0 else None
+            next_word = words[i+1] if i < len(words)-1 else None
+
+            # Create context key for this specific word instance
+            temp_word_state = WordState(word, prev_word, next_word)
+            context_key = temp_word_state.get_context_key()
+
+            if context_key in self.word_states:
+                word_state = self.word_states[context_key]
+                if word_state.should_graduate():
+                    # This word can be graduated - use latest punctuation form
+                    output_word = word_state.get_output_word()
+                    self.confirmed_words.append(output_word)
+                    new_words_to_send.append(output_word)
+                    self.sent_words_count += 1
+                else:
+                    # Stop at first non-graduated word to maintain order
+                    if verbose:
+                        print(f"[GRAD] Stopped at '{word}' (freq={word_state.frequency}/4)")
+                    break
+            else:
+                # Word context not found, stop graduation
+                if verbose:
+                    print(f"[GRAD] Stopped at '{word}' - not seen before")
+                break
+
+        return new_words_to_send
+
+    def _try_n_word_match(self, n, words, words_clean, search_start, fallback=False):  # Deprecated
+        """Try to match the last n words from confirmed sequence"""
+        if len(self.confirmed_words) < n:
+            return 0
+
+        last_n = [strip_punctuation(w) for w in self.confirmed_words[-n:]]
+        # prefix = "[DEBUG FALLBACK]" if fallback else "[DEBUG]" # Verbose
+        # print(f"{prefix} Looking for last {n}: {last_n} in last 20 words: {words_clean[search_start:]}")
+
+        search_limit = len(words_clean) - n + 1
+        for i in range(search_start, search_limit):
+            if n == 1:
+                # Special case for single word matching
+                # Use words[i] for words_match_flexible as it expects original punctuation
+                if words_match_flexible(self.confirmed_words[-1], words[i]): # Compare original last confirmed with current original
+                    # print(f"{prefix} Found {n}-word match at position {i}, start_index = {i + 1}") # Verbose
+                    return i + 1 # Return index in `words` array for next word
+            else:
+                # Multi-word sequence matching
+                # Pass original `words` to sequence_matches_flexible
+                if sequence_matches_flexible(self.confirmed_words[-n:], words, i):
+                    # print(f"{prefix} Found {n}-word match at position {i}, start_index = {i + n}") # Verbose
+                    return i + n # Return index in `words` array for next word
+        return 0
+
+    def _try_fallback_matching(self, words, words_clean, search_start):
+        """Try matching by progressively removing words from the end of confirmed sequence"""
+        removed_words = []
+        min_words = getattr(self, 'min_confirmed_words', 4)
+
+        # Keep trying while we have more words than minimum
+        while len(self.confirmed_words) >= min_words:
+            # print(f"[DEBUG FALLBACK] Removing last confirmed word: '{self.confirmed_words[-1]}'") # Verbose
+
+            # Remove the last confirmed word
+            removed_words.append(self.confirmed_words.pop())
+            self.sent_words_count -= 1
+
+            # Try cascade: 4->3->2->1 words with remaining confirmed words
+            for n in [4, 3, 2, 1]:
+                start_index = self._try_n_word_match(n, words, words_clean, search_start, fallback=True)
+                if start_index > 0:
+                    # print(f"[DEBUG FALLBACK] Found match after removing {len(removed_words)} word(s)") # Verbose
+                    return start_index
+
+        # No match found, restore all removed words
+        # print(f"[DEBUG FALLBACK] No match found, restoring {len(removed_words)} removed word(s)") # Verbose
+        while removed_words:
+            self.confirmed_words.append(removed_words.pop())
+            self.sent_words_count += 1
+
+        return 0
+
+    def get_debug_info(self):
+        confirmed_words_debug = []
+        potential_words_debug = []
+
+        # Create a list of (frequency, word_state) for sorting
+        sorted_states = sorted(self.word_states.values(), key=lambda ws: ws.frequency, reverse=True)
+
+        for word_state in sorted_states:
+            context_str = f"[{word_state.prev_word or ''}-{word_state.next_word or ''}]"
+            debug_str = f"{word_state.latest_form}({word_state.frequency}){context_str}"
+            if word_state.state == "confirmed" and len(confirmed_words_debug) < 5:
+                confirmed_words_debug.append(debug_str)
+            elif word_state.state == "potential" and len(potential_words_debug) < 5:
+                potential_words_debug.append(debug_str)
+            if len(confirmed_words_debug) >=5 and len(potential_words_debug) >=5:
+                break
+
+        return {
+            "last_5_confirmed": confirmed_words_debug,
+            "potential_words": potential_words_debug
+        }
 
 
 def check_ffmpeg_in_path():
@@ -883,23 +589,12 @@ def load_model():
         import nemo.collections.asr as nemo_asr  # type: ignore
         check_ffmpeg_in_path()  # Check for ffmpeg before loading the model
         print("Loading Parakeet TDT model (lazy import)...")
-        
-        # Suppress progress bars during model loading
-        _suppress_progress_bars()
+        model = nemo_asr.models.ASRModel.from_pretrained(model_name="nvidia/parakeet-tdt-0.6b-v2")
+        # Move to GPU if available
         try:
-            # Additional tqdm suppression for model loading
-            import logging
-            logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
-            logging.getLogger("transformers.configuration_utils").setLevel(logging.ERROR)
-            
-            model = nemo_asr.models.ASRModel.from_pretrained(model_name="nvidia/parakeet-tdt-0.6b-v2")
-            # Move to GPU if available
-            try:
-                ASR_MODEL = model.cuda()
-            except Exception:
-                ASR_MODEL = model  # Fallback to CPU
-        finally:
-            _restore_stderr()
+            ASR_MODEL = model.cuda()
+        except Exception:
+            ASR_MODEL = model  # Fallback to CPU
         print("Model loaded.")
     return ASR_MODEL
 
@@ -1039,9 +734,7 @@ def process_and_transcribe_audio_file(input_path: str, segment_length_sec: int =
 
             # Transcribe the current segment
             print(f"Transcribing segment {i+1}/{num_segments} ({start_time/1000:.2f}s - {end_time/1000:.2f}s)...")
-            _suppress_progress_bars()
             segment_transcription_result = asr_model.transcribe([temp_wav_file_path])
-            _restore_stderr()
 
             if segment_transcription_result and len(segment_transcription_result) > 0 and hasattr(segment_transcription_result[0], 'text'):
                 all_transcriptions.append(segment_transcription_result[0].text)
@@ -1206,7 +899,6 @@ async def websocket_transcribe_endpoint(websocket: WebSocket):
     buffer = bytearray()
     tracker = TranscriptionTracker()
     is_initial_transcription = True
-    last_processed_buffer_size = 0  # Track last processed buffer size to avoid duplicates
 
     try:
         while True:
@@ -1219,11 +911,6 @@ async def websocket_transcribe_endpoint(websocket: WebSocket):
                     if verbose_logging:
                         print(f"[{time.strftime('%H:%M:%S')}] Timeout with no buffer, continuing.")
                     continue # No data and timeout, just continue waiting
-                # Skip if we're about to process the same buffer size again (duplicate processing)
-                if len(buffer) == last_processed_buffer_size:
-                    if verbose_logging:
-                        print(f"[{time.strftime('%H:%M:%S')}] Timeout with same buffer size ({len(buffer)}), skipping duplicate")
-                    continue
                 if verbose_logging:
                     print(f"[{time.strftime('%H:%M:%S')}] Timeout, processing buffered audio: {len(buffer)} bytes")
                 data = None # Indicate timeout processing
@@ -1270,12 +957,7 @@ async def websocket_transcribe_endpoint(websocket: WebSocket):
                 audio_segment.export(temp_wav_file_path, format="wav")
 
             transcription_start_time = time.time()
-            # Suppress progress bars during transcription
-            _suppress_progress_bars()
-            try:
-                transcription_result = asr_model.transcribe([temp_wav_file_path])
-            finally:
-                _restore_stderr()
+            transcription_result = asr_model.transcribe([temp_wav_file_path])
             transcription_end_time = time.time()
             os.remove(temp_wav_file_path)
 
@@ -1286,33 +968,21 @@ async def websocket_transcribe_endpoint(websocket: WebSocket):
 
             # Process through WordState tracker
             new_words_to_send = tracker.process_transcription(current_words, verbose_logging)
-            
-            # Update last processed buffer size
-            last_processed_buffer_size = len(buffer) if buffer else 0
 
             if new_words_to_send:
                 await websocket.send_text(" ".join(new_words_to_send))
                 if verbose_logging:
                     print(f"→ Sent: {' '.join(new_words_to_send)}")
-                    # Show cumulative sent words vs current raw transcription for comparison
-                    print(f"→ Total sent so far: {' '.join(tracker.confirmed_words)}")
-                    print(f"→ Current raw words: {' '.join(current_words)}")
                     debug_info = tracker.get_debug_info()
                     if debug_info['potential_words']:
                         print(f"→ Pending: {', '.join(debug_info['potential_words'][:3])}")
-            elif verbose_logging:
-                # Even when nothing is sent, show the comparison
-                print(f"→ No new words sent")
-                print(f"→ Total sent so far: {' '.join(tracker.confirmed_words)}")
-                print(f"→ Current raw words: {' '.join(current_words)}")
 
 
             # Manage buffer: if it's longer than window_size_bytes, keep only the latest part
-            # NEVER clear the buffer completely - it contains important context for alignment
             if len(buffer) > window_size_bytes:
                 buffer = buffer[-window_size_bytes:]
-                if verbose_logging:
-                    print(f"[{time.strftime('%H:%M:%S')}] Buffer trimmed to {len(buffer)} bytes (window limit)")
+            elif is_initial_transcription == False and not data : # If it was a timeout and not initial, clear buffer as it was processed
+                buffer = bytearray()
 
 
     except WebSocketDisconnect:
@@ -2018,8 +1688,6 @@ if __name__ == "__main__":
                         help="Port for the server (default: 5000). Only used with --server.")
     parser.add_argument("--verbose", action="store_true",
                         help="Enable verbose output for debugging.")
-    parser.add_argument("--stream-test", action="store_true",
-                        help="Test streaming vs batch transcription on an audio file and compare outputs.")
 
     args = parser.parse_args()
 
@@ -2035,72 +1703,14 @@ if __name__ == "__main__":
         if args.audio_file is None:
             parser.error("The 'audio_file' argument is required when not running in --server mode.")
 
-        if args.stream_test:
-            print(f"Running stream test comparison for: {args.audio_file}")
-            print("=" * 80)
-            
-            # Run batch transcription first
-            print("1. BATCH TRANSCRIPTION:")
-            print("-" * 40)
-            batch_result = process_and_transcribe_audio_file(args.audio_file, args.segment_length)
-            if batch_result.startswith("Error:"):
-                print(f"Batch transcription failed: {batch_result}")
-                exit(1)
-            
-            batch_words = batch_result.strip().split()
-            print(f"Batch result: {len(batch_words)} words")
-            
-            print("\n2. STREAMING TRANSCRIPTION (until divergence):")
-            print("-" * 40)
-            print("Legend: \033[92m[word]\033[0m=confirmed(5+) \033[93m(word)\033[0m=potential(2-4) \033[91mword\033[0m=new(1) \033[94m|word\033[0m=align-point")
-            print("-" * 40)
-            streaming_result, divergence_info = simulate_streaming_transcription(args.audio_file, batch_words, verbose=args.verbose)
-            
-            print("\n3. ANALYSIS:")
-            print("-" * 40)
-            
-            if divergence_info:
-                print(f"🚨 DIVERGENCE FOUND:")
-                print(f"  • Position: {divergence_info['position']}")
-                print(f"  • Time: {divergence_info['chunk_time']:.2f}s into audio")
-                print(f"  • Expected word: '{divergence_info['batch_word']}'")
-                print(f"  • Streaming word: '{divergence_info['stream_word']}'")
-                print(f"  • Streaming words so far: {divergence_info['streaming_words']}")
-                print(f"  • Raw transcription at divergence: {' '.join(divergence_info['raw_transcription'])}")
-                
-                # Show context around divergence
-                pos = divergence_info['position']
-                context_start = max(0, pos - 3)
-                context_end = min(len(batch_words), pos + 4)
-                
-                print(f"\n  📍 CONTEXT AROUND DIVERGENCE:")
-                print(f"     Batch:     {' '.join(batch_words[context_start:context_end])}")
-                print(f"     Streaming: {' '.join(streaming_result[context_start:context_end] if context_end <= len(streaming_result) else streaming_result[context_start:] + ['[MISSING]'] * (context_end - len(streaming_result)))}")
-                
-                # Calculate partial similarity up to divergence
-                matching_words = divergence_info['position']
-                total_words = max(len(batch_words), len(streaming_result))
-                similarity = matching_words / total_words * 100 if total_words > 0 else 0
-                print(f"\n  📊 SIMILARITY: {similarity:.1f}% ({matching_words}/{total_words} words match before divergence)")
-                
-            else:
-                streaming_words = streaming_result if isinstance(streaming_result, list) else streaming_result.split()
-                if len(streaming_words) == len(batch_words) and all(s == b for s, b in zip(streaming_words, batch_words)):
-                    print("✅ PERFECT MATCH! Streaming and batch results are identical.")
-                else:
-                    print("⚠️  No early divergence found, but results may differ at the end.")
-                    print(f"   Streaming: {len(streaming_words)} words")
-                    print(f"   Batch: {len(batch_words)} words")
-            
+        print(f"Running in CLI mode for input file: {args.audio_file}")
+        # process_and_transcribe_audio_file calls load_model() internally.
+        final_transcription = process_and_transcribe_audio_file(args.audio_file, args.segment_length)
+
+        if final_transcription.startswith("Error:") or "[Transcription Failed for Segment]" in final_transcription:
+            print(f"\nCLI Transcription Failed/Error: {final_transcription}")
         else:
-            print(f"Running in CLI mode for input file: {args.audio_file}")
-            # process_and_transcribe_audio_file calls load_model() internally.
-            final_transcription = process_and_transcribe_audio_file(args.audio_file, args.segment_length)
+            print("\nFull Transcription:")
+            print(final_transcription)
 
-            if final_transcription.startswith("Error:") or "[Transcription Failed for Segment]" in final_transcription:
-                print(f"\nCLI Transcription Failed/Error: {final_transcription}")
-            else:
-                print("\nFull Transcription:")
-                print(final_transcription)
-
-            print("CLI transcription process complete.")
+        print("CLI transcription process complete.")
