@@ -30,6 +30,18 @@ from sklearn.neighbors import NearestNeighbors
 import requests  # For calling OpenAI API
 import json
 
+# --- Disable tqdm progress bars globally (NeMo transcribe uses tqdm) ---
+# This prevents the persistent "Transcribing: 100%|" bars from cluttering stdout.
+# We both set the environment variable and monkey-patch as a fallback.
+import os as _os
+_os.environ.setdefault("TQDM_DISABLE", "1")
+try:
+    from tqdm import tqdm as _tqdm
+    from functools import partialmethod as _partialmethod
+    _tqdm.__init__ = _partialmethod(_tqdm.__init__, disable=True)
+except Exception as _e:
+    print(f"[Init] tqdm disable patch failed: {_e}")
+
 # Global variable for the ASR model
 ASR_MODEL = None
 
@@ -192,7 +204,8 @@ class WordState:
 
     def get_context_key(self):
         """Return a key that includes word and context for uniqueness"""
-        return (self.word_clean, self.prev_word, self.next_word)
+        # Include the original word to prevent context collisions
+        return (self.word_clean, self.prev_word, self.next_word, self.word)
 
     def _update_state(self):
         if self.frequency >= 4:
@@ -221,7 +234,7 @@ class TranscriptionTracker:
         self.sent_words_count = 0
         self.min_confirmed_words = min_confirmed_words  # Stop removing words when we reach this many
 
-    def process_transcription(self, words):
+    def process_transcription(self, words, verbose=False):
         new_words_to_send = []
 
         # Update word frequencies using context-aware keys
@@ -250,31 +263,24 @@ class TranscriptionTracker:
         # Search only in the last 20 words to avoid duplicate sequence matches
         search_start = max(0, len(words_clean) - 20)
 
-        # Try cascading search: 4 -> 3 -> 2 -> 1 words
-        for n in [4, 3, 2, 1]:
-            start_index = self._try_n_word_match(n, words, words_clean, search_start)
-            if start_index > 0:
-                break
-
-        # If no match found, try fallback with word removal
-        if start_index == 0 and len(self.confirmed_words) > 0:
-            start_index = self._try_fallback_matching(words, words_clean, search_start)
-
-        if start_index == 0 and len(self.confirmed_words) > 0:
-            # This case should ideally be rare if fallback matching works.
-            # If it happens, it means we couldn't align the new transcription at all.
-            # We might log an error or decide on a recovery strategy,
-            # like resetting confirmed_words or sending the whole new transcription.
-            # For now, let's print a warning and proceed as if it's a fresh start.
-            print(f"Warning: Sequence matching failed completely. Confirmed: {self.confirmed_words[-5:]}, New: {words[:20]}")
-            # As a simple recovery, we could reset confirmed_words, but this might lose context.
-            # Or, we could try to send the new words if the buffer is small.
-            # For now, we'll let it try to graduate from the beginning of `words`.
-            # This might lead to re-sending words if `confirmed_words` was not empty.
-            # A more robust solution might be needed here depending on observed behavior.
-            pass # Allow start_index to remain 0
+        # Efficient prefix alignment: find the longest prefix of current words
+        # that exactly equals the tail of confirmed_words. This prevents re-sending
+        # previously confirmed words while avoiding complex fuzzy matching.
+        if self.confirmed_words:
+            max_overlap = min(len(self.confirmed_words), len(words))
+            start_index = 0
+            for overlap in range(max_overlap, 0, -1):
+                tail = [strip_punctuation(w) for w in self.confirmed_words[-overlap:]]
+                head = [strip_punctuation(w) for w in words[:overlap]]
+                if tail == head:
+                    start_index = overlap
+                    break
+        else:
+            start_index = 0
 
         # Graduate words in strict sequential order from where confirmed sequence ends
+        if verbose:
+            print(f"[GRAD] Starting from index {start_index}, confirmed_words: {len(self.confirmed_words)}")
         for i in range(start_index, len(words)):
             word = words[i]
             prev_word = words[i-1] if i > 0 else None
@@ -294,14 +300,18 @@ class TranscriptionTracker:
                     self.sent_words_count += 1
                 else:
                     # Stop at first non-graduated word to maintain order
+                    if verbose:
+                        print(f"[GRAD] Stopped at '{word}' (freq={word_state.frequency}/4)")
                     break
             else:
                 # Word context not found, stop graduation
+                if verbose:
+                    print(f"[GRAD] Stopped at '{word}' - not seen before")
                 break
 
         return new_words_to_send
 
-    def _try_n_word_match(self, n, words, words_clean, search_start, fallback=False):
+    def _try_n_word_match(self, n, words, words_clean, search_start, fallback=False):  # Deprecated
         """Try to match the last n words from confirmed sequence"""
         if len(self.confirmed_words) < n:
             return 0
@@ -696,7 +706,7 @@ async def websocket_transcribe_endpoint(websocket: WebSocket):
     sample_width = 2 # 16-bit
     channels = 1
     window_size_seconds = 15 # Max audio buffer for transcription
-    min_audio_len_seconds = 5 # Min audio for initial transcription
+    min_audio_len_seconds = 3 # Min audio for initial transcription
     min_audio_len_bytes = min_audio_len_seconds * sample_rate * sample_width * channels
     window_size_bytes = window_size_seconds * sample_rate * sample_width * channels
 
@@ -771,12 +781,15 @@ async def websocket_transcribe_endpoint(websocket: WebSocket):
                 print(f"[{time.strftime('%H:%M:%S')}] Audio: {len(audio_segment)/1000:.2f}s, Transcribe time: {transcription_end_time-transcription_start_time:.2f}s, Raw: {' '.join(current_words)}")
 
             # Process through WordState tracker
-            new_words_to_send = tracker.process_transcription(current_words)
+            new_words_to_send = tracker.process_transcription(current_words, verbose_logging)
 
             if new_words_to_send:
                 await websocket.send_text(" ".join(new_words_to_send))
                 if verbose_logging:
-                    print(f"Sent: {' '.join(new_words_to_send)}")
+                    print(f"→ Sent: {' '.join(new_words_to_send)}")
+                    debug_info = tracker.get_debug_info()
+                    if debug_info['potential_words']:
+                        print(f"→ Pending: {', '.join(debug_info['potential_words'][:3])}")
 
 
             # Manage buffer: if it's longer than window_size_bytes, keep only the latest part
