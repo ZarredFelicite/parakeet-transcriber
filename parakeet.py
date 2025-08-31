@@ -175,13 +175,34 @@ class TranscriptionTracker:
                         print(f"[ALIGN] Found {overlap}-word overlap: {' '.join(self.confirmed_words[-overlap:])}")
                     break
         
-        # CRITICAL FIX: Never allow start_index to go backwards beyond confirmed words
-        # This prevents the catastrophic word duplication bug
+        # Handle alignment failures more gracefully
         min_allowed_start = len(self.confirmed_words)
         if start_index < min_allowed_start:
-            if verbose:
-                print(f"[ALIGN] Corrected start_index from {start_index} to {min_allowed_start} (confirmed words boundary)")
-            start_index = min_allowed_start
+            # If we can't find alignment, try to find the end of confirmed sequence in current transcription
+            found_partial_alignment = False
+            if self.confirmed_words and len(words) > 0:
+                # Try to find where the last few confirmed words appear in current transcription
+                # Start with longer sequences and work down to find the best match
+                for lookback in range(min(5, len(self.confirmed_words)), 0, -1):
+                    last_words = [normalize_word_for_matching(w) for w in self.confirmed_words[-lookback:]]
+                    # Look for this sequence in the current transcription
+                    for i in range(len(words) - lookback + 1):
+                        current_slice = words_normalized[i:i+lookback]
+                        if last_words == current_slice:
+                            start_index = i + lookback
+                            found_partial_alignment = True
+                            if verbose:
+                                print(f"[ALIGN] Found partial {lookback}-word alignment ending at index {start_index}")
+                                print(f"[ALIGN] Matched sequence: {' '.join(self.confirmed_words[-lookback:])}")
+                            break
+                    if found_partial_alignment:
+                        break
+            
+            # If still no alignment found, use boundary correction as last resort
+            if not found_partial_alignment:
+                if verbose:
+                    print(f"[ALIGN] No alignment found, corrected start_index from {start_index} to {min_allowed_start} (confirmed words boundary)")
+                start_index = min_allowed_start
         
         self.last_start_index = start_index
 
@@ -365,6 +386,93 @@ def sequence_matches_flexible(target_seq, words, start_pos):
     return True
 
 
+
+
+def simulate_streaming_transcription(audio_path: str, chunk_duration_ms: int = 250, verbose: bool = False):
+    """
+    Simulate streaming transcription by processing audio in chunks like the WebSocket endpoint.
+    Returns the cumulative streaming result for comparison with batch transcription.
+    """
+    asr_model = load_model()
+    
+    # Load and prepare audio
+    audio = AudioSegment.from_file(audio_path)
+    if audio.channels > 1:
+        audio = audio.set_channels(1)
+    if audio.frame_rate != 16000:
+        audio = audio.set_frame_rate(16000)
+    
+    # Convert to raw bytes
+    sample_rate = 16000
+    sample_width = 2
+    channels = 1
+    window_size_seconds = 15
+    min_audio_len_seconds = 3
+    min_audio_len_bytes = min_audio_len_seconds * sample_rate * sample_width * channels
+    window_size_bytes = window_size_seconds * sample_rate * sample_width * channels
+    
+    # Simulate streaming by processing chunks
+    buffer = bytearray()
+    tracker = TranscriptionTracker()
+    streaming_result = []
+    is_initial_transcription = True
+    
+    # Process audio in chunks
+    total_length_ms = len(audio)
+    chunk_size_ms = chunk_duration_ms
+    
+    print(f"[STREAM-TEST] Simulating streaming with {chunk_size_ms}ms chunks")
+    print(f"[STREAM-TEST] Total audio: {total_length_ms/1000:.2f}s")
+    
+    for chunk_start in range(0, total_length_ms, chunk_size_ms):
+        chunk_end = min(chunk_start + chunk_size_ms, total_length_ms)
+        chunk = audio[chunk_start:chunk_end]
+        
+        # Convert chunk to bytes and add to buffer
+        chunk_bytes = chunk.raw_data
+        buffer.extend(chunk_bytes)
+        
+        # Determine if we should transcribe
+        should_transcribe = False
+        if is_initial_transcription:
+            if len(buffer) >= min_audio_len_bytes:
+                should_transcribe = True
+                is_initial_transcription = False
+        else:
+            should_transcribe = True
+        
+        if should_transcribe:
+            # Convert buffer to AudioSegment for transcription
+            audio_segment = AudioSegment(data=buffer, sample_width=sample_width, frame_rate=sample_rate, channels=channels)
+            
+            # Transcribe
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmpfile:
+                temp_wav_file_path = tmpfile.name
+                audio_segment.export(temp_wav_file_path, format="wav")
+            
+            try:
+                transcription_result = asr_model.transcribe([temp_wav_file_path])
+                current_words = transcription_result[0].text.strip().split() if transcription_result and transcription_result[0].text else []
+                
+                if verbose:
+                    print(f"[STREAM-TEST] Chunk {chunk_start//chunk_size_ms}: {len(audio_segment)/1000:.2f}s, Raw: {' '.join(current_words)}")
+                
+                # Process through tracker
+                new_words = tracker.process_transcription(current_words, verbose)
+                if new_words:
+                    streaming_result.extend(new_words)
+                    if verbose:
+                        print(f"[STREAM-TEST] → Sent: {' '.join(new_words)}")
+                        print(f"[STREAM-TEST] → Total so far: {' '.join(streaming_result)}")
+                
+            finally:
+                os.remove(temp_wav_file_path)
+            
+            # Manage buffer size
+            if len(buffer) > window_size_bytes:
+                buffer = buffer[-window_size_bytes:]
+    
+    return ' '.join(streaming_result)
 
 
 def check_ffmpeg_in_path():
@@ -1525,6 +1633,8 @@ if __name__ == "__main__":
                         help="Port for the server (default: 5000). Only used with --server.")
     parser.add_argument("--verbose", action="store_true",
                         help="Enable verbose output for debugging.")
+    parser.add_argument("--stream-test", action="store_true",
+                        help="Test streaming vs batch transcription on an audio file and compare outputs.")
 
     args = parser.parse_args()
 
@@ -1540,14 +1650,67 @@ if __name__ == "__main__":
         if args.audio_file is None:
             parser.error("The 'audio_file' argument is required when not running in --server mode.")
 
-        print(f"Running in CLI mode for input file: {args.audio_file}")
-        # process_and_transcribe_audio_file calls load_model() internally.
-        final_transcription = process_and_transcribe_audio_file(args.audio_file, args.segment_length)
-
-        if final_transcription.startswith("Error:") or "[Transcription Failed for Segment]" in final_transcription:
-            print(f"\nCLI Transcription Failed/Error: {final_transcription}")
+        if args.stream_test:
+            print(f"Running stream test comparison for: {args.audio_file}")
+            print("=" * 80)
+            
+            # Run batch transcription
+            print("1. BATCH TRANSCRIPTION:")
+            print("-" * 40)
+            batch_result = process_and_transcribe_audio_file(args.audio_file, args.segment_length)
+            if batch_result.startswith("Error:"):
+                print(f"Batch transcription failed: {batch_result}")
+                exit(1)
+            print(f"Batch result: {batch_result}")
+            
+            print("\n2. STREAMING TRANSCRIPTION:")
+            print("-" * 40)
+            streaming_result = simulate_streaming_transcription(args.audio_file, verbose=args.verbose)
+            print(f"Streaming result: {streaming_result}")
+            
+            print("\n3. COMPARISON:")
+            print("-" * 40)
+            batch_words = batch_result.strip().split()
+            streaming_words = streaming_result.strip().split()
+            
+            print(f"Batch words: {len(batch_words)}")
+            print(f"Streaming words: {len(streaming_words)}")
+            
+            # Find differences
+            max_len = max(len(batch_words), len(streaming_words))
+            differences = []
+            
+            for i in range(max_len):
+                batch_word = batch_words[i] if i < len(batch_words) else "[MISSING]"
+                stream_word = streaming_words[i] if i < len(streaming_words) else "[MISSING]"
+                
+                if batch_word != stream_word:
+                    differences.append((i, batch_word, stream_word))
+            
+            if differences:
+                print(f"\nFound {len(differences)} differences:")
+                for i, (pos, batch_word, stream_word) in enumerate(differences[:10]):  # Show first 10
+                    print(f"  Position {pos}: Batch='{batch_word}' vs Streaming='{stream_word}'")
+                if len(differences) > 10:
+                    print(f"  ... and {len(differences) - 10} more differences")
+            else:
+                print("✅ Perfect match! Streaming and batch results are identical.")
+            
+            # Calculate similarity
+            matching_words = sum(1 for i in range(min(len(batch_words), len(streaming_words))) 
+                               if batch_words[i] == streaming_words[i])
+            similarity = matching_words / max(len(batch_words), len(streaming_words)) * 100
+            print(f"\nSimilarity: {similarity:.1f}% ({matching_words}/{max(len(batch_words), len(streaming_words))} words match)")
+            
         else:
-            print("\nFull Transcription:")
-            print(final_transcription)
+            print(f"Running in CLI mode for input file: {args.audio_file}")
+            # process_and_transcribe_audio_file calls load_model() internally.
+            final_transcription = process_and_transcribe_audio_file(args.audio_file, args.segment_length)
 
-        print("CLI transcription process complete.")
+            if final_transcription.startswith("Error:") or "[Transcription Failed for Segment]" in final_transcription:
+                print(f"\nCLI Transcription Failed/Error: {final_transcription}")
+            else:
+                print("\nFull Transcription:")
+                print(final_transcription)
+
+            print("CLI transcription process complete.")
