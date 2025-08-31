@@ -169,11 +169,15 @@ class TranscriptionTracker:
                     start_index = overlap
                     break
         
-        # Backtrack protection: prevent large retrograde jumps
-        if start_index < self.last_start_index - 5:  # Allow small backtracks but not large ones
+        # Backtrack protection: prevent large retrograde jumps but allow natural progression
+        if start_index < self.last_start_index - 10:  # Only prevent very large backtracks
             if verbose:
-                print(f"[BACKTRACK] Prevented jump from {self.last_start_index} to {start_index}")
-            start_index = max(0, self.last_start_index - 2)  # Allow small adjustment
+                print(f"[BACKTRACK] Prevented large jump from {self.last_start_index} to {start_index}")
+            start_index = max(0, self.last_start_index - 3)  # Allow moderate adjustment
+        elif start_index < self.last_start_index - 2 and len(words) < 5:  # Short transcriptions are often different
+            if verbose:
+                print(f"[BACKTRACK] Allowing short audio backtrack from {self.last_start_index} to {start_index}")
+            # Allow the backtrack for short audio segments
         
         self.last_start_index = start_index
 
@@ -388,6 +392,11 @@ def load_model():
         # Suppress progress bars during model loading
         _suppress_progress_bars()
         try:
+            # Additional tqdm suppression for model loading
+            import logging
+            logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
+            logging.getLogger("transformers.configuration_utils").setLevel(logging.ERROR)
+            
             model = nemo_asr.models.ASRModel.from_pretrained(model_name="nvidia/parakeet-tdt-0.6b-v2")
             # Move to GPU if available
             try:
@@ -758,7 +767,12 @@ async def websocket_transcribe_endpoint(websocket: WebSocket):
                 audio_segment.export(temp_wav_file_path, format="wav")
 
             transcription_start_time = time.time()
-            transcription_result = asr_model.transcribe([temp_wav_file_path])
+            # Suppress progress bars during transcription
+            _suppress_progress_bars()
+            try:
+                transcription_result = asr_model.transcribe([temp_wav_file_path])
+            finally:
+                _restore_stderr()
             transcription_end_time = time.time()
             os.remove(temp_wav_file_path)
 
