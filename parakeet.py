@@ -709,6 +709,7 @@ async def websocket_transcribe_endpoint(websocket: WebSocket):
     buffer = bytearray()
     tracker = TranscriptionTracker()
     is_initial_transcription = True
+    last_processed_buffer_size = 0  # Track last processed buffer size to avoid duplicates
 
     try:
         while True:
@@ -721,6 +722,11 @@ async def websocket_transcribe_endpoint(websocket: WebSocket):
                     if verbose_logging:
                         print(f"[{time.strftime('%H:%M:%S')}] Timeout with no buffer, continuing.")
                     continue # No data and timeout, just continue waiting
+                # Skip if we're about to process the same buffer size again (duplicate processing)
+                if len(buffer) == last_processed_buffer_size:
+                    if verbose_logging:
+                        print(f"[{time.strftime('%H:%M:%S')}] Timeout with same buffer size ({len(buffer)}), skipping duplicate")
+                    continue
                 if verbose_logging:
                     print(f"[{time.strftime('%H:%M:%S')}] Timeout, processing buffered audio: {len(buffer)} bytes")
                 data = None # Indicate timeout processing
@@ -783,6 +789,9 @@ async def websocket_transcribe_endpoint(websocket: WebSocket):
 
             # Process through WordState tracker
             new_words_to_send = tracker.process_transcription(current_words, verbose_logging)
+            
+            # Update last processed buffer size
+            last_processed_buffer_size = len(buffer) if buffer else 0
 
             if new_words_to_send:
                 await websocket.send_text(" ".join(new_words_to_send))
@@ -796,8 +805,10 @@ async def websocket_transcribe_endpoint(websocket: WebSocket):
             # Manage buffer: if it's longer than window_size_bytes, keep only the latest part
             if len(buffer) > window_size_bytes:
                 buffer = buffer[-window_size_bytes:]
-            elif is_initial_transcription == False and not data : # If it was a timeout and not initial, clear buffer as it was processed
+            elif not data:  # If it was a timeout (data is None), clear buffer as it was processed
                 buffer = bytearray()
+                if verbose_logging:
+                    print(f"[{time.strftime('%H:%M:%S')}] Buffer cleared after timeout processing")
 
 
     except WebSocketDisconnect:
