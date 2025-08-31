@@ -107,7 +107,7 @@ class TranscriptionTracker:
         
         # Context-aware tracking
         self.context_window = 2  # How many words of context to use
-        self.use_context_aware = True  # Enable context-aware tracking
+        self.use_context_aware = False  # Temporarily disable context-aware tracking for debugging
 
     def _get_context(self, words, position):
         """Get context for a word at given position."""
