@@ -453,10 +453,23 @@ class TranscriptionTracker:
                 if verbose:
                     print(f"[GRAD] Skip duplicate '{output_word}' (same as last confirmed)")
                 continue
+            # Check if this word is being seen at a position behind where we expect it
+            # But allow repeated words to graduate at their new position
             if state.last_seen_pos is not None and state.last_seen_pos < self.last_start_index:
-                if verbose:
-                    print(f"[GRAD] Abort: '{output_word}' last_seen_pos {state.last_seen_pos} < last_start_index {self.last_start_index}")
-                break
+                # Check if this is a repeated word that appears later in the transcript
+                word_already_confirmed = any(
+                    normalize_word_for_matching(confirmed_word) == norm 
+                    for confirmed_word in self.confirmed_words
+                )
+                if word_already_confirmed:
+                    # This is a repeated word appearing later - allow it to graduate
+                    if verbose:
+                        print(f"[GRAD] Allowing repeated word '{output_word}' to graduate at position {i} (previously at {state.last_seen_pos})")
+                else:
+                    # This is a word appearing out of order - skip it
+                    if verbose:
+                        print(f"[GRAD] Abort: '{output_word}' last_seen_pos {state.last_seen_pos} < last_start_index {self.last_start_index}")
+                    break
 
             self.confirmed_words.append(output_word)
             state.state = "confirmed"
