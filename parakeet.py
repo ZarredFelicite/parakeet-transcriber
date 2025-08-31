@@ -54,7 +54,7 @@ EMBEDDING_MODELS = {}
 
 def strip_punctuation(word):
     """Remove punctuation and normalize capitalization for matching purposes"""
-    return re.sub(r'[^\\w]', '', word).lower()
+    return re.sub(r'[^\w\s]', '', word).lower()
 
 
 def word_to_number(word):
@@ -67,6 +67,117 @@ def word_to_number(word):
         'thirty': '30', 'forty': '40', 'fifty': '50', 'sixty': '60', 'seventy': '70',
         'eighty': '80', 'ninety': '90', 'hundred': '100', 'thousand': '1000', 'million': '1000000'
     }
+    return word_to_num.get(word.lower(), word)
+
+
+def normalize_word_for_matching(word):
+    """Normalize word for matching, converting number words to digits and handling currency"""
+    # Remove punctuation and convert to lowercase
+    clean = strip_punctuation(word)
+
+    # Convert word numbers to digits
+    converted = word_to_number(clean)
+
+    return converted
+
+
+class WordState:
+    def __init__(self, word):
+        self.clean_word = strip_punctuation(word)
+        self.frequency = 1
+        self.latest_form = word # with punctuation
+        self.last_seen = time.time()
+
+    def increment(self, word_variant):
+        self.frequency += 1
+        self.latest_form = word_variant
+        self.last_seen = time.time()
+
+    def should_graduate(self, threshold=4):
+        # Lower threshold for proper nouns (capitalized)
+        grad_threshold = 3 if self.clean_word.istitle() and len(self.clean_word) > 1 else threshold
+        return self.frequency >= grad_threshold
+
+    def __repr__(self):
+        return f"'{self.latest_form}'(f={self.frequency})"
+
+
+class TranscriptionTracker:
+    def __init__(self, max_rewind=5, grad_threshold=4):
+        self.word_states = {}  # clean_word -> WordState
+        self.confirmed_words = []
+        self.normalized_confirmed_words = []
+        self.max_rewind = max_rewind
+        self.grad_threshold = grad_threshold
+
+    def process_transcription(self, words, verbose=False):
+        if not words:
+            return []
+
+        # 1. Update frequencies
+        for word in words:
+            clean_word = strip_punctuation(word)
+            if clean_word in self.word_states:
+                self.word_states[clean_word].increment(word)
+            else:
+                self.word_states[clean_word] = WordState(word)
+
+        # 2. Find alignment point
+        start_index = 0
+        if self.normalized_confirmed_words:
+            normalized_current = [normalize_word_for_matching(w) for w in words]
+            max_overlap = min(len(self.normalized_confirmed_words), len(normalized_current))
+            
+            for overlap in range(max_overlap, 0, -1):
+                tail = self.normalized_confirmed_words[-overlap:]
+                head = normalized_current[:overlap]
+                if tail == head:
+                    start_index = overlap
+                    break
+        
+        # 3. Backtrack guard
+        if start_index < len(self.confirmed_words) - self.max_rewind:
+            if verbose:
+                print(f"[WARN] Large backtrack detected (from {len(self.confirmed_words)} to {start_index}). Suppressing.")
+            return []
+
+        # 4. Graduate new words
+        newly_confirmed = []
+        if verbose:
+            print(f"[GRAD] Starting from index {start_index}, confirmed_words: {len(self.confirmed_words)}")
+
+        for i in range(start_index, len(words)):
+            word = words[i]
+            clean_word = strip_punctuation(word)
+            
+            if clean_word in self.word_states:
+                state = self.word_states[clean_word]
+                if state.should_graduate(self.grad_threshold):
+                    newly_confirmed.append(state.latest_form)
+                else:
+                    if verbose:
+                        print(f"[GRAD] Stopped at '{word}' (freq={state.frequency}/{self.grad_threshold})")
+                    break
+            else:
+                if verbose:
+                    print(f"[GRAD] Stopped at '{word}' - no state found.")
+                break
+        
+        if newly_confirmed:
+            self.confirmed_words.extend(newly_confirmed)
+            self.normalized_confirmed_words.extend([normalize_word_for_matching(w) for w in newly_confirmed])
+
+        return newly_confirmed
+
+    def get_debug_info(self):
+        potential_words = []
+        sorted_states = sorted(self.word_states.values(), key=lambda s: s.last_seen, reverse=True)
+        for state in sorted_states:
+            if not state.should_graduate(self.grad_threshold) and state.frequency >= 2:
+                potential_words.append(f"{state.latest_form}({state.frequency})")
+            if len(potential_words) >= 5:
+                break
+        return {"potential_words": potential_words}
     return word_to_num.get(word.lower(), word)
 
 
