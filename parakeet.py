@@ -1,34 +1,33 @@
 import argparse
 import os
-import nemo.collections.asr as nemo_asr
-from pydub import AudioSegment
 import tempfile
 import math
 from fastapi import FastAPI, File, UploadFile, HTTPException, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import JSONResponse
-import shutil # Needed for saving the uploaded file
-import subprocess # For running ffmpeg
+import shutil  # Needed for saving the uploaded file
+import subprocess  # For running ffmpeg
 import numpy as np
-import difflib
 import time
-from collections import deque
 import asyncio
-import re # Added for websocket_v3 code
-import torch  # For device placement in diarization
-from pyannote.audio import Pipeline  # Speaker diarization
-from dotenv import load_dotenv  # To load HF token from .env if present
-import hdbscan  # For clustering embeddings
-from pyannote.audio.pipelines.speaker_verification import PretrainedSpeakerEmbedding
-from pyannote.audio import Audio
-from pyannote.core import Segment
-import matplotlib.pyplot as plt  # For plotting embeddings
-from sklearn.manifold import TSNE
-from sklearn.decomposition import PCA
+import re  # For websocket logic
 import uuid
-import soundfile as sf  # For writing temporary WAVs for Titanet
-from sklearn.neighbors import NearestNeighbors
-import requests  # For calling OpenAI API
 import json
+
+# Lightweight imports kept at module load
+from pydub import AudioSegment
+
+# Heavy / optional dependencies are imported lazily inside functions:
+# - nemo.collections.asr (NeMo)
+# - torch
+# - pyannote.audio (Pipeline, Audio, PretrainedSpeakerEmbedding, Segment)
+# - hdbscan
+# - matplotlib / TSNE / PCA
+# - soundfile (sf)
+# - sklearn.neighbors (NearestNeighbors)
+# - requests (OpenAI API)
+# - python-dotenv (load_dotenv)
+# Each function that needs them will import locally so that simple server startup
+# or using only basic endpoints is faster.
 
 # --- Disable tqdm progress bars globally (NeMo transcribe uses tqdm) ---
 # This prevents the persistent "Transcribing: 100%|" bars from cluttering stdout.
@@ -402,14 +401,23 @@ def check_ffmpeg_in_path():
 
 
 def load_model():
-    """Loads the ASR model into the global ASR_MODEL variable if not already loaded."""
+    """Loads the ASR model into the global ASR_MODEL variable if not already loaded.
+
+    Heavy NeMo import occurs here to speed up initial module import.
+    """
     global ASR_MODEL
     if ASR_MODEL is None:
-        check_ffmpeg_in_path() # Check for ffmpeg before loading the model
-        print("Loading Parakeet TDT model...")
-        # Ensure the model is moved to the GPU if available
-        ASR_MODEL = nemo_asr.models.ASRModel.from_pretrained(model_name="nvidia/parakeet-tdt-0.6b-v2").cuda()
-        print("Model loaded and moved to GPU.")
+        # Local import (heavy)
+        import nemo.collections.asr as nemo_asr  # type: ignore
+        check_ffmpeg_in_path()  # Check for ffmpeg before loading the model
+        print("Loading Parakeet TDT model (lazy import)...")
+        model = nemo_asr.models.ASRModel.from_pretrained(model_name="nvidia/parakeet-tdt-0.6b-v2")
+        # Move to GPU if available
+        try:
+            ASR_MODEL = model.cuda()
+        except Exception:
+            ASR_MODEL = model  # Fallback to CPU
+        print("Model loaded.")
     return ASR_MODEL
 
 
@@ -881,23 +889,34 @@ async def transcribe_timestamps_endpoint(audio_file: UploadFile = File(...)):
 
 
 def load_diarization_pipeline():
-    """Load (or return cached) speaker-diarization pipeline."""
+    """Load (or return cached) speaker-diarization pipeline.
+
+    Performs lazy imports for pyannote + torch + dotenv.
+    """
     global DIARIZATION_PIPELINE
     if DIARIZATION_PIPELINE is None:
-        # Ensure we have the token (either already in env or loaded from .env)
-        load_dotenv()
+        try:
+            from dotenv import load_dotenv  # type: ignore
+            load_dotenv()
+        except Exception:
+            pass  # .env loading is optional
         hf_token = os.getenv("HUGGINGFACE_ACCESS_TOKEN", "")
         if hf_token == "":
             raise EnvironmentError(
                 "HUGGINGFACE_ACCESS_TOKEN not set in environment or .env file; required for diarization pipeline."  # noqa: E501
             )
+        import torch  # type: ignore
+        from pyannote.audio import Pipeline  # type: ignore
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Loading pyannote speaker-diarization pipeline on {device}…")
+        print(f"Loading pyannote speaker-diarization pipeline on {device} (lazy import)…")
         DIARIZATION_PIPELINE = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
             use_auth_token=hf_token,
         )
-        DIARIZATION_PIPELINE.to(device)
+        try:
+            DIARIZATION_PIPELINE.to(device)
+        except Exception:
+            pass
     return DIARIZATION_PIPELINE
 
 
@@ -1083,18 +1102,29 @@ def convert_audio_to_wav_mono_16k(src_path: str, dst_dir: str) -> str:
 # ---------------------------------------------------------------------------
 
 def load_embedding_model(model_type: str = "ecapa"):
-    """Return a speaker-embedding model instance for *model_type* (cached)."""
+    """Return a speaker-embedding model instance for *model_type* (cached).
+
+    Lazy-loads heavy dependencies.
+    """
     model_type = model_type.lower()
     if model_type in EMBEDDING_MODELS:
         return EMBEDDING_MODELS[model_type]
 
+    import torch  # type: ignore
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[Embeddings] Loading '{model_type}' model on {device} …")
+    print(f"[Embeddings] Loading '{model_type}' model on {device} (lazy import)…")
 
     if model_type == "ecapa":
+        from pyannote.audio.pipelines.speaker_verification import PretrainedSpeakerEmbedding  # type: ignore
         model = PretrainedSpeakerEmbedding("speechbrain/spkrec-ecapa-voxceleb", device=device)
     elif model_type == "titanet":
-        model = nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained(model_name="titanet_large").to(device).eval()
+        import nemo.collections.asr as nemo_asr  # type: ignore
+        model = (
+            nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained(model_name="titanet_large")
+            .to(device)
+            .eval()
+        )
     else:
         raise ValueError(f"Unsupported embedding model_type '{model_type}'")
 
@@ -1109,9 +1139,16 @@ def compute_segment_embeddings(audio_path: str, segments, model_type: str = "eca
       - "ecapa"
       - "titanet"
       - "combo"  → concatenation of ECAPA and Titanet vectors
+
+    Heavy imports (pyannote, torch, soundfile) are done lazily.
     """
 
     model_type = model_type.lower()
+    from pyannote.audio import Audio  # type: ignore
+    from pyannote.core import Segment  # type: ignore
+    import torch  # type: ignore
+    import soundfile as sf  # type: ignore
+
     audio_helper = Audio(sample_rate=16000, mono="downmix")
 
     def _single_embedding(single_model: str, seg):
@@ -1167,19 +1204,21 @@ def compute_segment_embeddings(audio_path: str, segments, model_type: str = "eca
 
 
 def cluster_embeddings(embeddings):
-    """Cluster embeddings with HDBSCAN and return label list."""
+    """Cluster embeddings with HDBSCAN and return label list.
+
+    Lazily imports hdbscan.
+    """
     if len(embeddings) <= 1:
         return [0] * len(embeddings)
 
+    import hdbscan  # type: ignore
+
     emb_arr = np.vstack(embeddings)
-    # Small datasets may require min_cluster_size 1, but HDBSCAN needs >=2.
     clusterer = hdbscan.HDBSCAN(
         min_cluster_size=5,
         metric="euclidean",
         min_samples=2,
-        #cluster_selection_epsilon=0.1,
         cluster_selection_method="eom",
-        #alpha=0.5,
     )
     labels = clusterer.fit_predict(emb_arr)
     return labels.tolist()
@@ -1208,10 +1247,14 @@ def save_embedding_projection_plot(embeddings, labels, out_path):
     """Project high-dim speaker embeddings to 2-D and save a scatter plot.
 
     Uses TSNE for <= 100 points; PCA otherwise (faster). Unknown labels (-1)
-    are plotted in gray.
+    are plotted in gray. Imports heavy libs lazily.
     """
     if len(embeddings) == 0:
         return None
+
+    import matplotlib.pyplot as plt  # type: ignore
+    from sklearn.manifold import TSNE  # type: ignore
+    from sklearn.decomposition import PCA  # type: ignore
 
     emb_arr = np.vstack(embeddings)
 
@@ -1222,7 +1265,6 @@ def save_embedding_projection_plot(embeddings, labels, out_path):
         reducer = PCA(n_components=2)
         coords = reducer.fit_transform(emb_arr)
 
-    # Prepare color palette
     unique_labels = sorted(set(labels))
     cmap = plt.get_cmap("tab10")
 
@@ -1254,23 +1296,10 @@ def save_embedding_projection_plot(embeddings, labels, out_path):
 def knn_fill_noise_labels(embeddings, labels, k: int = 5, distance_threshold: float = 2):
     """Assign cluster labels to HDBSCAN noise points using k-NN.
 
-    Parameters
-    ----------
-    embeddings : list[np.ndarray] | np.ndarray
-        The same embeddings array passed to HDBSCAN.
-    labels : list[int]
-        Labels output by HDBSCAN (with -1 for noise).
-    k : int, optional
-        Number of neighbors to consider for voting.
-    distance_threshold : float, optional
-        Maximum average distance to the *k* neighbors allowed for adopting the
-        neighbor majority label. Larger values -> more assignments.
-    Returns
-    -------
-    list[int]
-        New label list where some previous `-1` elements may be replaced by a
-        positive cluster id.
+    Lazily imports sklearn.neighbors.
     """
+    from sklearn.neighbors import NearestNeighbors  # type: ignore
+
     emb_arr = np.vstack(embeddings)
     labels = np.asarray(labels)
 
@@ -1292,7 +1321,6 @@ def knn_fill_noise_labels(embeddings, labels, k: int = 5, distance_threshold: fl
         mean_dist = dist_row.mean()
         if mean_dist <= distance_threshold:
             neighbor_labels = core_labels[idx_row]
-            # vote majority
             counts = np.bincount(neighbor_labels)
             pred_lab = counts.argmax()
             new_labels[np.where(noise_mask)[0][i_noise]] = pred_lab
@@ -1306,16 +1334,19 @@ def knn_fill_noise_labels(embeddings, labels, k: int = 5, distance_threshold: fl
 def replace_speaker_ids_with_names(segments):
     """Call OpenAI API to infer names for speaker ids and apply replacements.
 
-    The function builds a prompt containing the dialogue. It expects the model
-    to return a JSON object mapping original ids (e.g. "speaker_1") to a
-    dash-separated lower-case name string (e.g. "john" or "customer-service").
+    Lazily imports dotenv + requests; only used when name_labels=True.
     """
-    load_dotenv()
+    try:
+        from dotenv import load_dotenv  # type: ignore
+        load_dotenv()
+    except Exception:
+        pass
+    import requests  # type: ignore
+
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY not set in environment or .env file")
 
-    # Build transcript string
     dialogue_lines = [f"{seg['speaker']}: {seg['text']}" for seg in segments]
     dialogue_text = "\n".join(dialogue_lines)
 
@@ -1357,11 +1388,9 @@ def replace_speaker_ids_with_names(segments):
         print("[OpenAI] Failed to parse JSON response, leaving labels unchanged.")
         return segments
 
-    # Apply mapping
     for seg in segments:
         if seg["speaker"] in mapping:
             seg["speaker"] = mapping[seg["speaker"]]
-        # update sub-segments too
         if "segments" in seg:
             for sub in seg["segments"]:
                 if sub["speaker"] in mapping:

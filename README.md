@@ -1,18 +1,31 @@
 # Parakeet Audio Transcription
 
-This project provides a tool for audio transcription using the NVIDIA NeMo Parakeet TDT (Text-Dependent Transcription) model. It can be used via a command-line interface or as a FastAPI web server with a WebSocket endpoint for real-time streaming.
+This project provides a comprehensive audio transcription solution using the NVIDIA NeMo Parakeet TDT (Text-Dependent Transcription) model. It supports both command-line usage and a FastAPI web server with multiple endpoints for different transcription needs.
 
 ## Features
 
-* Audio transcription using the powerful Parakeet TDT model.
-* Supports various audio (WAV, MP3) and video (MP4, MKV, AVI, MOV, WMV, FLV, WebM) formats by extracting the audio stream.
-* Automatic conversion to mono and resampling to 16kHz for compatibility with the ASR model.
-* Splits long audio files into segments for efficient processing (CLI and POST endpoint).
-* Provides both a Command-Line Interface (CLI) and a FastAPI web server mode.
-* FastAPI server includes:
-  * A POST endpoint (`/transcribe`) for batch transcription of uploaded files.
-  * A WebSocket endpoint (`/ws/transcribe`) for real-time streaming transcription.
-* Real-time transcription features advanced word stabilization and context-aware punctuation.
+### Core Transcription
+* Audio transcription using the powerful Parakeet TDT 0.6B v2 model
+* Supports various audio (WAV, MP3) and video (MP4, MKV, AVI, MOV, WMV, FLV, WebM) formats by extracting the audio stream
+* Automatic conversion to mono and resampling to 16kHz for compatibility with the ASR model
+* Splits long audio files into segments for efficient processing (CLI and POST endpoint)
+
+### Server Modes
+* **Command-Line Interface (CLI)** for single file transcription
+* **FastAPI web server** with multiple endpoints:
+  * `/transcribe` - Basic batch transcription of uploaded files
+  * `/transcribe_timestamps` - Transcription with segment-level timestamps
+  * `/transcribe_diarize` - Transcription with speaker diarization using pyannote.audio
+  * `/transcribe_cluster` - Transcription with speaker clustering using embeddings (ECAPA/TitaNet)
+  * `/ws/transcribe` - Real-time streaming transcription via WebSocket
+
+### Advanced Features
+* **Real-time transcription** with advanced word stabilization and context-aware punctuation
+* **Speaker diarization** using pyannote.audio pipeline for identifying different speakers
+* **Speaker clustering** using ECAPA or TitaNet embeddings with HDBSCAN clustering
+* **OpenAI integration** for inferring speaker names from conversation context
+* **Embedding visualization** with t-SNE/PCA projection plots
+* **Streaming client** with voice activity detection and typing mode
 
 ## Getting Started
 
@@ -82,91 +95,231 @@ By default, the server will run on `http://0.0.0.0:5000`. You can customize the 
 python parakeet.py --server --host 127.0.0.1 --port 8000 --segment_length 45 --verbose
 ```
 
-The server exposes two main endpoints:
+The server exposes multiple endpoints:
 
 #### 1. POST `/transcribe`
 
-Accepts POST requests with an audio or video file in the `audio_file` form data field for batch transcription.
-
-Example using `curl`:
+Basic batch transcription endpoint that accepts audio or video files.
 
 ```bash
 curl -X POST -F "audio_file=@/path/to/your/input_file.mp4" http://127.0.0.1:5000/transcribe
 ```
 
-Replace `.mp4` with the actual file extension of your audio or video file.
-
-The server will return a JSON response containing the transcription:
-
+Response:
 ```json
 {
   "transcription": "Your transcribed text here."
 }
 ```
 
-If an error occurs, the response will contain an "error" field.
+#### 2. POST `/transcribe_timestamps`
 
-#### 2. WebSocket `/ws/transcribe`
+Transcription with segment-level timestamps from the NeMo model.
 
-Provides a WebSocket endpoint for real-time streaming transcription. This is ideal for applications that need to process audio as it is being recorded or streamed.
+```bash
+curl -X POST -F "audio_file=@/path/to/your/input_file.mp4" http://127.0.0.1:5000/transcribe_timestamps
+```
 
-**How it Works:**
+Response:
+```json
+{
+  "transcription": "Full transcription text",
+  "segments": [
+    {"start": 0.0, "end": 4.23, "text": "first spoken segment"},
+    {"start": 4.23, "end": 8.45, "text": "second spoken segment"}
+  ]
+}
+```
 
-The client establishes a WebSocket connection to `ws://<host>:<port>/ws/transcribe`. It can pass `chunk_duration_ms` and `verbose` as query parameters. The client then streams audio chunks (16-bit, 16kHz, mono PCM). The server transcribes the audio, applying word stabilization and contextual punctuation, and sends back confirmed words in real-time.
+#### 3. POST `/transcribe_diarize`
+
+Transcription with speaker diarization using pyannote.audio pipeline. Requires `HUGGINGFACE_ACCESS_TOKEN` in environment or `.env` file.
+
+```bash
+curl -X POST -F "audio_file=@/path/to/your/input_file.mp4" http://127.0.0.1:5000/transcribe_diarize
+```
+
+Response:
+```json
+{
+  "segments": [
+    {"start": 0.0, "end": 3.2, "speaker": "SPEAKER_00", "text": "Hello there.", "segments": [...]},
+    {"start": 3.2, "end": 7.5, "speaker": "SPEAKER_01", "text": "Hi!", "segments": [...]}
+  ]
+}
+```
+
+#### 4. POST `/transcribe_cluster`
+
+Transcription with speaker clustering using embeddings (ECAPA or TitaNet models).
+
+```bash
+curl -X POST -F "audio_file=@/path/to/your/input_file.mp4" \
+  "http://127.0.0.1:5000/transcribe_cluster?model=ecapa&name_labels=true"
+```
+
+Query parameters:
+- `model`: `ecapa`, `titanet`, or `combo` (default: `ecapa`)
+- `name_labels`: `true` to use OpenAI for name inference (requires `OPENAI_API_KEY`)
+
+#### 5. WebSocket `/ws/transcribe`
+
+Real-time streaming transcription endpoint with advanced word stabilization.
+
+**Connection:** `ws://<host>:<port>/ws/transcribe?chunk_duration_ms=250`
+
+The client streams 16-bit, 16kHz, mono PCM audio chunks. The server applies word stabilization and contextual punctuation, sending back confirmed words in real-time.
 
 ### Client Script for Streaming (`client.py`)
 
-A client script, `client.py`, is provided to demonstrate how to stream audio from a microphone to the WebSocket endpoint (`/ws/transcribe`).
+A sophisticated client script for real-time audio streaming with voice activity detection and multiple output modes.
 
-**Prerequisites:**
-
-The Nix environment provides all necessary dependencies. However, if you run the client outside of the managed environment, you may need to install `portaudio`:
-
-* On Debian/Ubuntu: `sudo apt-get install portaudio19-dev`
-* On macOS (using Homebrew): `brew install portaudio`
+**Features:**
+- Voice Activity Detection (VAD) with configurable aggressiveness
+- Automatic silence detection and stopping (5 seconds of silence)
+- Typing mode that inputs transcription directly into focused applications
+- Verbose mode with timing and profiling information
+- Configurable chunk duration and server connection
 
 **Usage:**
 
-1. Make sure the server is running (`nix run .#parakeet` or `python parakeet.py --server`).
-
-2. Run the client script:
-
+1. Start the server:
    ```bash
-   python client.py
+   nix run .#parakeet  # or python parakeet.py --server
    ```
 
-   The script will start recording from your default microphone and stream the audio to the server. It will print the transcribed words as they are received. The client automatically stops after 5 seconds of silence. The WebSocket URI is configurable and defaults to `ws://localhost:5000/ws/transcribe?chunk_duration_ms=250`.
+2. Run the client:
+   ```bash
+   python client.py [options]
+   ```
+
+**Options:**
+- `--send_interval_ms 250`: Audio chunk duration in milliseconds
+- `--verbose`: Enable detailed logging and timing information
+- `--type [delay]`: Type transcription into focused window (requires `wtype`)
+- `--host localhost`: Server hostname
+- `--port 5000`: Server port
+
+**Examples:**
+```bash
+# Basic usage - prints transcription to stdout
+python client.py
+
+# Verbose mode with timing information
+python client.py --verbose
+
+# Type transcription into focused application with 10ms delay
+python client.py --type 10
+
+# Connect to remote server
+python client.py --host 192.168.1.100 --port 5001
+```
+
+**Typing Mode:**
+When using `--type`, the client requires `wtype` (Wayland) for typing functionality. The transcription will be typed directly into the currently focused application instead of printed to stdout.
 
 ## Project Structure
 
-* `parakeet.py`: The main script containing the CLI and FastAPI server logic.
-* `client.py`: An example client for the real-time streaming WebSocket endpoint.
-* `flake.nix`: The Nix flake for managing the development environment and dependencies.
-* `pyproject.toml`: Defines the Python project metadata and dependencies.
-* `README.md`: You are here!
+```
+asr2/
+├── parakeet.py          # Main server with CLI and FastAPI endpoints
+├── client.py            # Streaming client with VAD and typing support
+├── flake.nix           # Nix development environment and dependencies
+├── pyproject.toml      # Python project metadata and dependencies
+├── uv.lock            # Locked dependency versions
+├── .env               # Environment variables (HuggingFace, OpenAI tokens)
+├── .gitignore         # Git ignore patterns
+├── LICENSE            # Project license
+└── README.md          # This file
+```
 
-## Dependencies
+### Key Components
 
-The main Python dependencies are managed via `pyproject.toml` and installed by `uv` within the Nix development shell:
+**`parakeet.py`** - Main application with:
+- CLI mode for single file transcription
+- FastAPI server with 5 different endpoints
+- Advanced WebSocket streaming with word stabilization
+- Speaker diarization and clustering capabilities
+- OpenAI integration for speaker name inference
 
-* `numpy`
-* `torch`
-* `Cython`
-* `packaging`
-* `nemo_toolkit['asr']`
-* `fastapi`
-* `uvicorn[standard]` (for WebSocket support)
-* `pydub`
-* `python-multipart` (for FastAPI file uploads)
-* `websockets` (though `uvicorn[standard]` should cover this for server-side)
-* `pyaudio` (for `client.py`)
+**`client.py`** - Streaming client featuring:
+- Voice Activity Detection (WebRTC VAD)
+- Automatic silence detection and stopping
+- Real-time audio streaming to WebSocket
+- Typing mode for direct input to applications
+- Comprehensive timing and profiling options
 
-System-level dependencies, including CUDA and FFmpeg, are handled by the Nix environment defined in `flake.nix`.
+## Configuration
 
-## Error Handling
+### Environment Variables
 
-The script includes basic error handling for cases like the audio file not being found or issues during audio processing. Error messages will be printed to the console in CLI mode or returned in the JSON response in Server mode.
+Create a `.env` file in the project root for optional features:
 
-## Cleanup
+```bash
+# Required for speaker diarization (/transcribe_diarize)
+HUGGINGFACE_ACCESS_TOKEN=your_hf_token_here
 
-Temporary audio segment files created during processing are automatically removed.
+# Required for OpenAI name inference (name_labels=true in /transcribe_cluster)
+OPENAI_API_KEY=your_openai_api_key_here
+```
+
+### Dependencies
+
+**Python Dependencies** (managed via `pyproject.toml` and `uv`):
+- Core: `numpy`, `torch`, `nemo_toolkit[asr]`
+- Web: `fastapi`, `uvicorn`, `websockets`, `python-multipart`
+- Audio: `pyaudio`, `webrtcvad`, `pydub`
+- ML/AI: `pyannote.audio`, `hdbscan`, `scikit-learn`, `matplotlib`
+- Utils: `Cython`, `packaging`, `dotenv`, `evdev-binary`
+
+**System Dependencies** (handled by Nix):
+- CUDA toolkit and runtime for GPU acceleration
+- FFmpeg for audio/video processing
+- PortAudio for microphone input
+- Various system libraries (zlib, libgcc, X11, etc.)
+
+## Advanced Usage
+
+### Speaker Diarization vs Clustering
+
+**Diarization (`/transcribe_diarize`):**
+- Uses pyannote.audio's pre-trained pipeline
+- More accurate for well-separated speakers
+- Requires HuggingFace token
+- Slower processing time
+
+**Clustering (`/transcribe_cluster`):**
+- Uses speaker embeddings (ECAPA/TitaNet) with HDBSCAN
+- Better for overlapping speech or noisy audio
+- Faster processing
+- Optional OpenAI name inference
+
+### Embedding Models
+
+- **ECAPA**: Fast, good general performance
+- **TitaNet**: Higher quality, slower processing
+- **Combo**: Concatenated ECAPA + TitaNet embeddings
+
+### Performance Tuning
+
+- Adjust `--segment_length` for memory usage (default: 60 seconds)
+- Use `--verbose` for detailed timing information
+- GPU acceleration is automatic when CUDA is available
+- WebSocket chunk duration affects latency vs accuracy trade-off
+
+## Troubleshooting
+
+### Common Issues
+
+1. **CUDA out of memory**: Reduce `--segment_length` parameter
+2. **FFmpeg not found**: Ensure you're in the Nix development shell
+3. **HuggingFace token error**: Set `HUGGINGFACE_ACCESS_TOKEN` in `.env`
+4. **Audio device issues**: Check microphone permissions and availability
+5. **Typing mode not working**: Install `wtype` for Wayland or check X11 setup
+
+### Error Handling
+
+- CLI mode: Errors printed to console with detailed messages
+- Server mode: HTTP error responses with status codes and details
+- WebSocket: Connection errors handled gracefully with reconnection support
+- Temporary files: Automatically cleaned up after processing
