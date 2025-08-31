@@ -168,7 +168,7 @@ class WordState:
         """Return normalized word as key - context will be handled at tracker level"""
         return self.word_clean
 
-    def should_graduate(self, min_frequency=4, min_consecutive=2, require_pos_consistency=False, min_pos_consistent=1):
+    def should_graduate(self, min_frequency=4, min_consecutive=2, require_pos_consistency=False, min_pos_consistent=1, confirmed_words=None):
         """Decide whether this word should be considered confirmed.
 
         We require BOTH a minimum total frequency and a minimum number of
@@ -176,6 +176,9 @@ class WordState:
 
         Optionally, require position-consistency (observed near the same token
         index across rounds) by setting require_pos_consistency=True.
+        
+        For repeated words that have already been confirmed, we relax the
+        positional consistency requirement to prevent blocking.
         """
         freq_ok = self.frequency >= min_frequency
         consec_ok = self.seen_in_row >= min_consecutive
@@ -183,6 +186,18 @@ class WordState:
             return freq_ok and consec_ok
         else:
             pos_ok = self.pos_consistent_in_row >= min_pos_consistent
+            
+            # Special handling for repeated words: if this word has already been
+            # confirmed before, relax the positional consistency requirement
+            if not pos_ok and confirmed_words is not None:
+                word_already_confirmed = any(
+                    normalize_word_for_matching(confirmed_word) == self.word_clean 
+                    for confirmed_word in confirmed_words
+                )
+                if word_already_confirmed and freq_ok and consec_ok:
+                    # For repeated words, only require basic frequency and consecutive observation
+                    return True
+            
             return freq_ok and consec_ok and pos_ok
 
     def get_output_word(self):
@@ -351,6 +366,26 @@ class TranscriptionTracker:
         self.last_start_index = start_index
 
         # -----------------------------
+        # 2.5. Rollback mechanism for dropped words
+        # -----------------------------
+        # If we have confirmed words but the ASR transcript is missing expected words,
+        # we may need to rollback some confirmed words to maintain alignment
+        if self.confirmed_words and start_index < len(self.confirmed_words):
+            words_to_rollback = len(self.confirmed_words) - start_index
+            if words_to_rollback > 0 and words_to_rollback <= 3:  # Only rollback a few words
+                if verbose:
+                    print(f"[ROLLBACK] ASR appears to have dropped {words_to_rollback} words. Rolling back confirmed words from {len(self.confirmed_words)} to {start_index}")
+                # Move rolled-back words back to unconfirmed state
+                for _ in range(words_to_rollback):
+                    if self.confirmed_words:
+                        rolled_back_word = self.confirmed_words.pop()
+                        norm = normalize_word_for_matching(rolled_back_word)
+                        if norm in self.word_states:
+                            self.word_states[norm].state = "unconfirmed"
+                            if verbose:
+                                print(f"[ROLLBACK] Moved '{rolled_back_word}' back to unconfirmed state")
+
+        # -----------------------------
         # 3. Graduation (monotonic sequence extension)
         # -----------------------------
         if verbose:
@@ -383,10 +418,13 @@ class TranscriptionTracker:
 
             require_pos = True
             min_pos_consistent = 2
-            freq_ok = state.frequency >= self.min_frequency
-            consec_ok = state.seen_in_row >= self.min_consecutive_rounds
-            pos_ok = state.pos_consistent_in_row >= min_pos_consistent
-            can_graduate = freq_ok and consec_ok and (not require_pos or pos_ok)
+            can_graduate = state.should_graduate(
+                min_frequency=self.min_frequency,
+                min_consecutive=self.min_consecutive_rounds,
+                require_pos_consistency=require_pos,
+                min_pos_consistent=min_pos_consistent,
+                confirmed_words=self.confirmed_words
+            )
 
             if verbose:
                 print(f"[GRAD] Eval '{word}': idx={i} expected={expected_index} freq={state.frequency}/{self.min_frequency} consec={state.seen_in_row}/{self.min_consecutive_rounds} pos_cons={state.pos_consistent_in_row}/{min_pos_consistent} last_seen_pos={state.last_seen_pos} last_start_index={self.last_start_index} -> {'GRAD' if can_graduate else 'HOLD'}")
