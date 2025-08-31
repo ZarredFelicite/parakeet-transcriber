@@ -109,7 +109,7 @@ class WordState:
         self.last_seen_pos = None
         self.pos_consistent_in_row = 0
 
-    def increment_frequency(self, word_variant, current_round=None, current_pos=None):
+    def increment_frequency(self, word_variant, current_round=None, current_pos=None, pos_tolerance=1):
         """Increment frequency for this word and update consecutive-round and position-consistency counters.
 
         Parameters
@@ -152,7 +152,7 @@ class WordState:
                 self.pos_consistent_in_row = 1
             else:
                 # If this observation is near the previous observed position, count as consistent
-                if abs(current_pos - self.last_seen_pos) <= 1:
+                if abs(current_pos - self.last_seen_pos) <= pos_tolerance:
                     # If the round is consecutive (or same), increment pos_consistent_in_row
                     if current_round is None or self.last_seen_round is None or current_round == self.last_seen_round or current_round == self.last_seen_round + 1:
                         self.pos_consistent_in_row += 1
@@ -179,13 +179,6 @@ class WordState:
         """
         freq_ok = self.frequency >= min_frequency
         consec_ok = self.seen_in_row >= min_consecutive
-
-        # If a word has already been confirmed, be more lenient for subsequent appearances.
-        # This helps repeated words (like 'do' in this case) to pass graduation
-        # without being trapped by positional consistency checks.
-        if self.state == "confirmed":
-            return freq_ok and consec_ok
-
         if not require_pos_consistency:
             return freq_ok and consec_ok
         else:
