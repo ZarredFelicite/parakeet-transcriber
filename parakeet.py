@@ -287,6 +287,8 @@ class TranscriptionTracker:
         min_allowed_start = len(self.confirmed_words)
         if start_index < min_allowed_start:
             found_partial_alignment = False
+            best_forward_candidate = None  # (potential_start, lookback, i)
+            best_backward_candidate = None  # closest (highest) potential_start < min_allowed_start
             if self.confirmed_words and words:
                 max_lookback = min(5, len(self.confirmed_words))
                 for lookback in range(max_lookback, 0, -1):
@@ -299,24 +301,52 @@ class TranscriptionTracker:
                             potential_start = i + lookback
                             max_backtrack = min(10, len(self.confirmed_words) // 2)
                             allowed_floor = len(self.confirmed_words) - max_backtrack
-                            decision = potential_start >= allowed_floor
                             if verbose:
-                                print(f"[ALIGN]  Candidate at i={i} -> potential_start={potential_start} allowed_floor={allowed_floor} backtrack_ok={decision}")
-                            if decision:
-                                start_index = potential_start
-                                found_partial_alignment = True
-                                if verbose:
-                                    print(f"[ALIGN]  Accepted partial match (lookback={lookback}) start_index={start_index}")
-                                break
+                                print(f"[ALIGN]  Candidate at i={i} -> potential_start={potential_start} allowed_floor={allowed_floor}")
+                            # Track forward and backward separately; we will pick the safest after search
+                            if potential_start >= min_allowed_start:
+                                # Forward (or exact) continuation. Prefer the SMALLEST forward jump.
+                                if best_forward_candidate is None or potential_start < best_forward_candidate[0]:
+                                    best_forward_candidate = (potential_start, lookback, i)
                             else:
-                                if verbose:
-                                    print(f"[ALIGN]  Rejected (too far back)")
-                    if found_partial_alignment:
-                        break
+                                # Backward (some rollback). Prefer the LARGEST potential_start (minimal rollback) >= allowed_floor
+                                if potential_start >= allowed_floor:
+                                    if best_backward_candidate is None or potential_start > best_backward_candidate[0]:
+                                        best_backward_candidate = (potential_start, lookback, i)
+                # Decide which candidate to use
+                chosen = None
+                if best_forward_candidate is not None:
+                    potential_start, lookback, i = best_forward_candidate
+                    # Disallow forward jumps larger than +1 to prevent skipping unseen tokens
+                    if potential_start > min_allowed_start + 1:
+                        if verbose:
+                            print(f"[ALIGN]  Forward candidate would skip tokens (potential_start={potential_start} > {min_allowed_start}+1). Clamping to {min_allowed_start}.")
+                        start_index = min_allowed_start
+                    else:
+                        start_index = potential_start
+                        chosen = ('forward', best_forward_candidate)
+                elif best_backward_candidate is not None:
+                    potential_start, lookback, i = best_backward_candidate
+                    start_index = potential_start
+                    chosen = ('backward', best_backward_candidate)
+                if verbose:
+                    if chosen:
+                        direction, data = chosen
+                        ps, lb, idx = data
+                        print(f"[ALIGN]  Selected {direction} candidate start_index={start_index} (lookback={lb} at i={idx})")
+                    else:
+                        print(f"[ALIGN]  No suitable partial candidate found")
+                found_partial_alignment = chosen is not None
             if not found_partial_alignment:
                 if verbose:
                     print(f"[ALIGN] Fallback boundary correction {start_index}->{min_allowed_start}")
                 start_index = min_allowed_start
+
+        # Final safety: never allow forward skip beyond current confirmed length
+        if start_index > len(self.confirmed_words):
+            if verbose:
+                print(f"[ALIGN] Safety clamp forward start_index {start_index}->{len(self.confirmed_words)}")
+            start_index = len(self.confirmed_words)
 
         self.last_start_index = start_index
 
@@ -330,22 +360,26 @@ class TranscriptionTracker:
             norm = normalize_word_for_matching(word)
             expected_index = len(self.confirmed_words)
 
-            if i < expected_index:
+            # Strict monotonic ordering: token index must equal expected_index exactly.
+            if i != expected_index:
                 if verbose:
-                    print(f"[GRAD] Abort: token_index {i} < expected {expected_index} (backtrack)")
+                    reason = 'backtrack' if i < expected_index else 'forward drift'
+                    print(f"[GRAD] Abort: token_index {i} != expected {expected_index} ({reason})")
                 break
-            if i > expected_index + 1:
-                if verbose:
-                    print(f"[GRAD] Abort: token_index {i} > expected+1 ({expected_index+1}) (forward jump)")
-                break
-            if i == expected_index + 1 and verbose:
-                print(f"[GRAD] Allow forward drift: token_index {i} expected {expected_index}")
 
             state = self.word_states.get(norm)
             if state is None:
                 if verbose:
                     print(f"[GRAD] Stop: '{word}' unseen state (norm={norm})")
                 break
+
+            # Sanity: ensure alignment didn't skip an expected next token from raw transcript
+            if expected_index > 0:
+                prev_confirmed_norm = normalize_word_for_matching(self.confirmed_words[-1])
+                if i > 0:
+                    prev_raw_norm = normalize_word_for_matching(words[i-1])
+                    if prev_raw_norm != prev_confirmed_norm and verbose:
+                        print(f"[GRAD] Warning: preceding raw token '{words[i-1]}' (norm={prev_raw_norm}) != last confirmed '{self.confirmed_words[-1]}' (norm={prev_confirmed_norm})")
 
             require_pos = True
             min_pos_consistent = 2
@@ -358,22 +392,18 @@ class TranscriptionTracker:
                 print(f"[GRAD] Eval '{word}': idx={i} expected={expected_index} freq={state.frequency}/{self.min_frequency} consec={state.seen_in_row}/{self.min_consecutive_rounds} pos_cons={state.pos_consistent_in_row}/{min_pos_consistent} last_seen_pos={state.last_seen_pos} last_start_index={self.last_start_index} -> {'GRAD' if can_graduate else 'HOLD'}")
 
             if not can_graduate:
-                # Stop at first non-graduating token to maintain order
                 break
 
             output_word = state.get_output_word()
-            # Duplicate immediate guard
             if self.confirmed_words and normalize_word_for_matching(self.confirmed_words[-1]) == norm:
                 if verbose:
                     print(f"[GRAD] Skip duplicate '{output_word}' (same as last confirmed)")
                 continue
-            # Positional safety relative to alignment start
             if state.last_seen_pos is not None and state.last_seen_pos < self.last_start_index:
                 if verbose:
                     print(f"[GRAD] Abort: '{output_word}' last_seen_pos {state.last_seen_pos} < last_start_index {self.last_start_index}")
                 break
 
-            # Confirm word
             self.confirmed_words.append(output_word)
             state.state = "confirmed"
             new_words_to_send.append(output_word)
