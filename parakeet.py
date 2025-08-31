@@ -169,15 +169,13 @@ class TranscriptionTracker:
                     start_index = overlap
                     break
         
-        # Backtrack protection: prevent large retrograde jumps but allow natural progression
-        if start_index < self.last_start_index - 10:  # Only prevent very large backtracks
+        # CRITICAL FIX: Never allow start_index to go backwards beyond confirmed words
+        # This prevents the catastrophic word duplication bug
+        min_allowed_start = len(self.confirmed_words)
+        if start_index < min_allowed_start:
             if verbose:
-                print(f"[BACKTRACK] Prevented large jump from {self.last_start_index} to {start_index}")
-            start_index = max(0, self.last_start_index - 3)  # Allow moderate adjustment
-        elif start_index < self.last_start_index - 2 and len(words) < 5:  # Short transcriptions are often different
-            if verbose:
-                print(f"[BACKTRACK] Allowing short audio backtrack from {self.last_start_index} to {start_index}")
-            # Allow the backtrack for short audio segments
+                print(f"[ALIGN] Corrected start_index from {start_index} to {min_allowed_start} (confirmed words boundary)")
+            start_index = min_allowed_start
         
         self.last_start_index = start_index
 
