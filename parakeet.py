@@ -283,9 +283,11 @@ class TranscriptionTracker:
             # Get context for this word
             context = self._get_context(words, i)
             
-            # Create context-aware key
+            # Create context-aware key with fuzzy matching
             if self.use_context_aware and context is not None:
-                word_key = f"{normalize_word_for_matching(word)}@{'-'.join([normalize_word_for_matching(w) if w else '_' for w in context])}"
+                # Use only the core context (word + immediate neighbors) for more stability
+                core_context = context[1:4] if len(context) >= 4 else context  # prev1, word, next1
+                word_key = f"{normalize_word_for_matching(word)}@{'-'.join([normalize_word_for_matching(w) if w else '_' for w in core_context])}"
             else:
                 word_key = normalize_word_for_matching(word)
             
@@ -473,9 +475,11 @@ class TranscriptionTracker:
             # Get context for this word in graduation phase
             context = self._get_context(words, i)
             
-            # Create context-aware key for graduation
+            # Create context-aware key for graduation with fuzzy matching
             if self.use_context_aware and context is not None:
-                word_key = f"{normalize_word_for_matching(word)}@{'-'.join([normalize_word_for_matching(w) if w else '_' for w in context])}"
+                # Use only the core context (word + immediate neighbors) for more stability
+                core_context = context[1:4] if len(context) >= 4 else context  # prev1, word, next1
+                word_key = f"{normalize_word_for_matching(word)}@{'-'.join([normalize_word_for_matching(w) if w else '_' for w in core_context])}"
             else:
                 word_key = normalize_word_for_matching(word)
             
@@ -495,9 +499,19 @@ class TranscriptionTracker:
 
             require_pos = True
             min_pos_consistent = 2
+            
+            # Use relaxed thresholds for context-aware tracking
+            if self.use_context_aware and "@" in word_key:
+                # Context-aware words need less consecutive rounds since contexts are more specific
+                min_consecutive = max(1, self.min_consecutive_rounds - 1)
+                min_frequency = max(1, self.min_frequency - 1)
+            else:
+                min_consecutive = self.min_consecutive_rounds
+                min_frequency = self.min_frequency
+            
             can_graduate = state.should_graduate(
-                min_frequency=self.min_frequency,
-                min_consecutive=self.min_consecutive_rounds,
+                min_frequency=min_frequency,
+                min_consecutive=min_consecutive,
                 require_pos_consistency=require_pos,
                 min_pos_consistent=min_pos_consistent,
                 confirmed_words=self.confirmed_words
