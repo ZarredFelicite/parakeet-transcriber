@@ -803,12 +803,11 @@ async def websocket_transcribe_endpoint(websocket: WebSocket):
 
 
             # Manage buffer: if it's longer than window_size_bytes, keep only the latest part
+            # NEVER clear the buffer completely - it contains important context for alignment
             if len(buffer) > window_size_bytes:
                 buffer = buffer[-window_size_bytes:]
-            elif not data:  # If it was a timeout (data is None), clear buffer as it was processed
-                buffer = bytearray()
                 if verbose_logging:
-                    print(f"[{time.strftime('%H:%M:%S')}] Buffer cleared after timeout processing")
+                    print(f"[{time.strftime('%H:%M:%S')}] Buffer trimmed to {len(buffer)} bytes (window limit)")
 
 
     except WebSocketDisconnect:
