@@ -162,11 +162,17 @@ class TranscriptionTracker:
         # Robust prefix alignment using normalized words
         if self.confirmed_words:
             max_overlap = min(len(self.confirmed_words), len(words))
+            if verbose:
+                print(f"[ALIGN] Trying to match last {max_overlap} confirmed words with current transcription")
+                print(f"[ALIGN] Last confirmed: {' '.join(self.confirmed_words[-min(5, len(self.confirmed_words)):])}")
+                print(f"[ALIGN] Current start: {' '.join(words[:min(5, len(words))])}")
             for overlap in range(max_overlap, 0, -1):
                 tail = [normalize_word_for_matching(w) for w in self.confirmed_words[-overlap:]]
                 head = words_normalized[:overlap]
                 if tail == head:
                     start_index = overlap
+                    if verbose:
+                        print(f"[ALIGN] Found {overlap}-word overlap: {' '.join(self.confirmed_words[-overlap:])}")
                     break
         
         # CRITICAL FIX: Never allow start_index to go backwards beyond confirmed words
@@ -795,9 +801,17 @@ async def websocket_transcribe_endpoint(websocket: WebSocket):
                 await websocket.send_text(" ".join(new_words_to_send))
                 if verbose_logging:
                     print(f"→ Sent: {' '.join(new_words_to_send)}")
+                    # Show cumulative sent words vs current raw transcription for comparison
+                    print(f"→ Total sent so far: {' '.join(tracker.confirmed_words)}")
+                    print(f"→ Current raw words: {' '.join(current_words)}")
                     debug_info = tracker.get_debug_info()
                     if debug_info['potential_words']:
                         print(f"→ Pending: {', '.join(debug_info['potential_words'][:3])}")
+            elif verbose_logging:
+                # Even when nothing is sent, show the comparison
+                print(f"→ No new words sent")
+                print(f"→ Total sent so far: {' '.join(tracker.confirmed_words)}")
+                print(f"→ Current raw words: {' '.join(current_words)}")
 
 
             # Manage buffer: if it's longer than window_size_bytes, keep only the latest part
