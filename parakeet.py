@@ -215,6 +215,8 @@ class TranscriptionTracker:
         self.sent_words_count = 0
         self.min_confirmed_words = min_confirmed_words  # Stop removing words when we reach this many
         self.last_start_index = 0  # Track last start_index to prevent large backtracks
+        self.stall_count = 0  # Track how many rounds we've been stuck at the same position
+        self.stall_threshold = 10  # Force more aggressive alignment after this many stalls
 
         # Round tracking: each call to process_transcription increments the round_id
         # so we can track consecutive rounds a word appears in.
@@ -363,6 +365,20 @@ class TranscriptionTracker:
                 print(f"[ALIGN] Safety clamp forward start_index {start_index}->{len(self.confirmed_words)}")
             start_index = len(self.confirmed_words)
 
+        # Track alignment stalls FIRST
+        if start_index == self.last_start_index:
+            self.stall_count += 1
+        else:
+            self.stall_count = 0
+        
+        # Check if we're in a stall situation and need to force progress
+        if self.stall_count >= self.stall_threshold:
+            # Force more aggressive alignment to break the stall
+            if verbose:
+                print(f"[ALIGN] Stall detected ({self.stall_count} rounds), forcing alignment forward by 1")
+            start_index = min(start_index + 1, len(self.confirmed_words))
+            self.stall_count = 0  # Reset stall counter after forcing alignment
+        
         self.last_start_index = start_index
 
         # -----------------------------

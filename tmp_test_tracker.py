@@ -99,6 +99,8 @@ class TranscriptionTracker:
         self.sent_words_count = 0
         self.min_confirmed_words = min_confirmed_words
         self.last_start_index = 0
+        self.stall_count = 0  # Track how many rounds we've been stuck at the same position
+        self.stall_threshold = 10  # Force more aggressive alignment after this many stalls
         self.current_round = 0
         self.min_frequency = min_frequency
         self.min_consecutive_rounds = min_consecutive_rounds
@@ -149,8 +151,8 @@ class TranscriptionTracker:
                     start_index = overlap
                     break
         min_allowed_start = len(self.confirmed_words)
+        found_partial_alignment = False
         if start_index < min_allowed_start:
-            found_partial_alignment = False
             if self.confirmed_words and len(words) > 0:
                 for lookback in range(min(5, len(self.confirmed_words)), 0, -1):
                     last_words = [normalize_word_for_matching(w) for w in self.confirmed_words[-lookback:]]
@@ -167,6 +169,29 @@ class TranscriptionTracker:
                         break
             if not found_partial_alignment:
                 start_index = min_allowed_start
+        
+        # Track alignment stalls FIRST
+        if start_index == self.last_start_index:
+            self.stall_count += 1
+        else:
+            self.stall_count = 0
+        
+        # Check if we're in a stall situation and need to force progress
+        if self.stall_count >= self.stall_threshold and not found_partial_alignment:
+            # Force more aggressive alignment to break the stall
+            if verbose:
+                print(f"[ALIGN] Stall detected ({self.stall_count} rounds), forcing alignment to {len(self.confirmed_words)}")
+            start_index = len(self.confirmed_words)
+            self.stall_count = 0  # Reset stall counter after forcing alignment
+        elif not found_partial_alignment and start_index < len(self.confirmed_words):
+            # Conservative fallback: only advance by 1 position to avoid skipping words
+            conservative_start = max(start_index, self.last_start_index + 1)
+            if conservative_start > len(self.confirmed_words):
+                conservative_start = len(self.confirmed_words)
+            if verbose:
+                print(f"[ALIGN] Conservative fallback {start_index}->{conservative_start} (stall_count={self.stall_count})")
+            start_index = conservative_start
+        
         self.last_start_index = start_index
 
         # Graduation with monotonic guard
