@@ -388,10 +388,11 @@ def sequence_matches_flexible(target_seq, words, start_pos):
 
 
 
-def simulate_streaming_transcription(audio_path: str, chunk_duration_ms: int = 250, verbose: bool = False):
+def simulate_streaming_transcription(audio_path: str, batch_words: list, chunk_duration_ms: int = 250, verbose: bool = False):
     """
     Simulate streaming transcription by processing audio in chunks like the WebSocket endpoint.
-    Returns the cumulative streaming result for comparison with batch transcription.
+    Stops as soon as the streaming result diverges from the batch transcription.
+    Returns (streaming_result, divergence_info).
     """
     asr_model = load_model()
     
@@ -420,9 +421,11 @@ def simulate_streaming_transcription(audio_path: str, chunk_duration_ms: int = 2
     # Process audio in chunks
     total_length_ms = len(audio)
     chunk_size_ms = chunk_duration_ms
+    divergence_info = None
     
     print(f"[STREAM-TEST] Simulating streaming with {chunk_size_ms}ms chunks")
     print(f"[STREAM-TEST] Total audio: {total_length_ms/1000:.2f}s")
+    print(f"[STREAM-TEST] Target batch result: {' '.join(batch_words[:10])}{'...' if len(batch_words) > 10 else ''}")
     
     for chunk_start in range(0, total_length_ms, chunk_size_ms):
         chunk_end = min(chunk_start + chunk_size_ms, total_length_ms)
@@ -465,6 +468,26 @@ def simulate_streaming_transcription(audio_path: str, chunk_duration_ms: int = 2
                         print(f"[STREAM-TEST] → Sent: {' '.join(new_words)}")
                         print(f"[STREAM-TEST] → Total so far: {' '.join(streaming_result)}")
                 
+                # Check for divergence after each chunk that produces words
+                if streaming_result:
+                    # Compare current streaming result with batch result
+                    for i, stream_word in enumerate(streaming_result):
+                        if i >= len(batch_words) or stream_word != batch_words[i]:
+                            divergence_info = {
+                                'position': i,
+                                'chunk_time': chunk_end / 1000.0,
+                                'streaming_words': len(streaming_result),
+                                'batch_words': len(batch_words),
+                                'stream_word': stream_word if i < len(streaming_result) else '[MISSING]',
+                                'batch_word': batch_words[i] if i < len(batch_words) else '[MISSING]',
+                                'streaming_result': streaming_result.copy(),
+                                'raw_transcription': current_words.copy()
+                            }
+                            print(f"[STREAM-TEST] 🚨 DIVERGENCE DETECTED at position {i} after {chunk_end/1000:.2f}s")
+                            print(f"[STREAM-TEST] Expected: '{batch_words[i] if i < len(batch_words) else '[MISSING]'}'")
+                            print(f"[STREAM-TEST] Got: '{stream_word if i < len(streaming_result) else '[MISSING]'}'")
+                            return streaming_result, divergence_info
+                
             finally:
                 os.remove(temp_wav_file_path)
             
@@ -472,7 +495,8 @@ def simulate_streaming_transcription(audio_path: str, chunk_duration_ms: int = 2
             if len(buffer) > window_size_bytes:
                 buffer = buffer[-window_size_bytes:]
     
-    return ' '.join(streaming_result)
+    # If we get here, no divergence was found
+    return streaming_result, divergence_info
 
 
 def check_ffmpeg_in_path():
@@ -1654,53 +1678,56 @@ if __name__ == "__main__":
             print(f"Running stream test comparison for: {args.audio_file}")
             print("=" * 80)
             
-            # Run batch transcription
+            # Run batch transcription first
             print("1. BATCH TRANSCRIPTION:")
             print("-" * 40)
             batch_result = process_and_transcribe_audio_file(args.audio_file, args.segment_length)
             if batch_result.startswith("Error:"):
                 print(f"Batch transcription failed: {batch_result}")
                 exit(1)
-            print(f"Batch result: {batch_result}")
             
-            print("\n2. STREAMING TRANSCRIPTION:")
-            print("-" * 40)
-            streaming_result = simulate_streaming_transcription(args.audio_file, verbose=args.verbose)
-            print(f"Streaming result: {streaming_result}")
-            
-            print("\n3. COMPARISON:")
-            print("-" * 40)
             batch_words = batch_result.strip().split()
-            streaming_words = streaming_result.strip().split()
+            print(f"Batch result ({len(batch_words)} words): {batch_result}")
             
-            print(f"Batch words: {len(batch_words)}")
-            print(f"Streaming words: {len(streaming_words)}")
+            print("\n2. STREAMING TRANSCRIPTION (until divergence):")
+            print("-" * 40)
+            streaming_result, divergence_info = simulate_streaming_transcription(args.audio_file, batch_words, verbose=args.verbose)
             
-            # Find differences
-            max_len = max(len(batch_words), len(streaming_words))
-            differences = []
+            print("\n3. ANALYSIS:")
+            print("-" * 40)
             
-            for i in range(max_len):
-                batch_word = batch_words[i] if i < len(batch_words) else "[MISSING]"
-                stream_word = streaming_words[i] if i < len(streaming_words) else "[MISSING]"
+            if divergence_info:
+                print(f"🚨 DIVERGENCE FOUND:")
+                print(f"  • Position: {divergence_info['position']}")
+                print(f"  • Time: {divergence_info['chunk_time']:.2f}s into audio")
+                print(f"  • Expected word: '{divergence_info['batch_word']}'")
+                print(f"  • Streaming word: '{divergence_info['stream_word']}'")
+                print(f"  • Streaming words so far: {divergence_info['streaming_words']}")
+                print(f"  • Raw transcription at divergence: {' '.join(divergence_info['raw_transcription'])}")
                 
-                if batch_word != stream_word:
-                    differences.append((i, batch_word, stream_word))
-            
-            if differences:
-                print(f"\nFound {len(differences)} differences:")
-                for i, (pos, batch_word, stream_word) in enumerate(differences[:10]):  # Show first 10
-                    print(f"  Position {pos}: Batch='{batch_word}' vs Streaming='{stream_word}'")
-                if len(differences) > 10:
-                    print(f"  ... and {len(differences) - 10} more differences")
+                # Show context around divergence
+                pos = divergence_info['position']
+                context_start = max(0, pos - 3)
+                context_end = min(len(batch_words), pos + 4)
+                
+                print(f"\n  📍 CONTEXT AROUND DIVERGENCE:")
+                print(f"     Batch:     {' '.join(batch_words[context_start:context_end])}")
+                print(f"     Streaming: {' '.join(streaming_result[context_start:context_end] if context_end <= len(streaming_result) else streaming_result[context_start:] + ['[MISSING]'] * (context_end - len(streaming_result)))}")
+                
+                # Calculate partial similarity up to divergence
+                matching_words = divergence_info['position']
+                total_words = max(len(batch_words), len(streaming_result))
+                similarity = matching_words / total_words * 100 if total_words > 0 else 0
+                print(f"\n  📊 SIMILARITY: {similarity:.1f}% ({matching_words}/{total_words} words match before divergence)")
+                
             else:
-                print("✅ Perfect match! Streaming and batch results are identical.")
-            
-            # Calculate similarity
-            matching_words = sum(1 for i in range(min(len(batch_words), len(streaming_words))) 
-                               if batch_words[i] == streaming_words[i])
-            similarity = matching_words / max(len(batch_words), len(streaming_words)) * 100
-            print(f"\nSimilarity: {similarity:.1f}% ({matching_words}/{max(len(batch_words), len(streaming_words))} words match)")
+                streaming_words = streaming_result if isinstance(streaming_result, list) else streaming_result.split()
+                if len(streaming_words) == len(batch_words) and all(s == b for s, b in zip(streaming_words, batch_words)):
+                    print("✅ PERFECT MATCH! Streaming and batch results are identical.")
+                else:
+                    print("⚠️  No early divergence found, but results may differ at the end.")
+                    print(f"   Streaming: {len(streaming_words)} words")
+                    print(f"   Batch: {len(batch_words)} words")
             
         else:
             print(f"Running in CLI mode for input file: {args.audio_file}")
