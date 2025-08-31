@@ -201,10 +201,19 @@ class TranscriptionTracker:
             word = words[i]
             word_key = normalize_word_for_matching(word)
             expected_index = len(self.confirmed_words)
-            if i != expected_index:
+            # Allow small position drifts due to ASR transcript instability
+            position_tolerance = 1
+            if abs(i - expected_index) > position_tolerance:
                 if verbose:
-                    print(f"[GRAD] Position mismatch: token index {i} != expected confirmed index {expected_index}. Aborting graduation to preserve order.")
+                    reason = 'backtrack' if i < expected_index else 'forward drift'
+                    print(f"[GRAD] Position mismatch: token index {i} != expected confirmed index {expected_index} ({reason}). Aborting graduation to preserve order.")
                 break
+            elif i != expected_index:
+                if verbose:
+                    drift_direction = 'behind' if i < expected_index else 'ahead'
+                    print(f"[GRAD] Small position drift: token index {i} vs expected {expected_index} ({drift_direction}). Allowing with tolerance.")
+                # Adjust expected_index to match current position for this iteration
+                expected_index = i
             if word_key in self.word_states:
                 word_state = self.word_states[word_key]
                 require_pos = True
