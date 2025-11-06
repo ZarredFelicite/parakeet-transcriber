@@ -1,0 +1,81 @@
+Checking for ffmpeg in PATH...
+ffmpeg found in PATH.
+Loading Parakeet TDT model (lazy import)...
+[NeMo I 2025-08-31 13:08:33 mixins:181] Tokenizer SentencePieceTokenizer initialized with 1024 tokens
+[NeMo W 2025-08-31 13:08:33 modelPT:180] If you intend to do training or fine-tuning, please call the ModelPT.setup_training_data() method and provide a valid configuration file to setup the train data loader.
+    Train config : 
+    use_lhotse: true
+    skip_missing_manifest_entries: true
+    input_cfg: null
+    tarred_audio_filepaths: null
+    manifest_filepath: null
+    sample_rate: 16000
+    shuffle: true
+    num_workers: 2
+    pin_memory: true
+    max_duration: 40.0
+    min_duration: 0.1
+    text_field: answer
+    batch_duration: null
+    use_bucketing: true
+    bucket_duration_bins: null
+    bucket_batch_size: null
+    num_buckets: 30
+    bucket_buffer_size: 20000
+    shuffle_buffer_size: 10000
+    
+[NeMo W 2025-08-31 13:08:33 modelPT:187] If you intend to do validation, please call the ModelPT.setup_validation_data() or ModelPT.setup_multiple_validation_data() method and provide a valid configuration file to setup the validation data loader(s). 
+    Validation config : 
+    use_lhotse: true
+    manifest_filepath: null
+    sample_rate: 16000
+    batch_size: 16
+    shuffle: false
+    max_duration: 40.0
+    min_duration: 0.1
+    num_workers: 2
+    pin_memory: true
+    text_field: answer
+    
+[NeMo I 2025-08-31 13:08:33 features:305] PADDING: 0
+[NeMo I 2025-08-31 13:08:38 rnnt_models:226] Using RNNT Loss : tdt
+    Loss tdt_kwargs: {'fastemit_lambda': 0.0, 'clamp': -1.0, 'durations': [0, 1, 2, 3, 4], 'sigma': 0.02, 'omega': 0.1}
+[NeMo I 2025-08-31 13:08:38 rnnt_models:226] Using RNNT Loss : tdt
+    Loss tdt_kwargs: {'fastemit_lambda': 0.0, 'clamp': -1.0, 'durations': [0, 1, 2, 3, 4], 'sigma': 0.02, 'omega': 0.1}
+[NeMo W 2025-08-31 13:08:38 tdt_loop_labels_computer:300] No conditional node support for Cuda.
+    Cuda graphs with while loops are disabled, decoding speed will be slower
+    Reason: No `cuda-python` module. Please do `pip install cuda-python>=12.3`
+[NeMo I 2025-08-31 13:08:38 rnnt_models:226] Using RNNT Loss : tdt
+    Loss tdt_kwargs: {'fastemit_lambda': 0.0, 'clamp': -1.0, 'durations': [0, 1, 2, 3, 4], 'sigma': 0.02, 'omega': 0.1}
+[NeMo W 2025-08-31 13:08:38 tdt_loop_labels_computer:300] No conditional node support for Cuda.
+    Cuda graphs with while loops are disabled, decoding speed will be slower
+    Reason: No `cuda-python` module. Please do `pip install cuda-python>=12.3`
+Traceback (most recent call last):
+  File "/home/zarred/dev/asr2/parakeet.py", line 1557, in <module>
+    load_model() # Load model when server starts
+  File "/home/zarred/dev/asr2/parakeet.py", line 454, in load_model
+    model = nemo_asr.models.ASRModel.from_pretrained(model_name="nvidia/parakeet-tdt-0.6b-v2")
+  File "/home/zarred/dev/asr2/.venv/lib/python3.10/site-packages/nemo/core/classes/common.py", line 765, in from_pretrained
+    instance = class_.restore_from(
+  File "/home/zarred/dev/asr2/.venv/lib/python3.10/site-packages/nemo/core/classes/modelPT.py", line 482, in restore_from
+    instance = cls._save_restore_connector.restore_from(
+  File "/home/zarred/dev/asr2/.venv/lib/python3.10/site-packages/nemo/core/connectors/save_restore_connector.py", line 260, in restore_from
+    loaded_params = self.load_config_and_state_dict(
+  File "/home/zarred/dev/asr2/.venv/lib/python3.10/site-packages/nemo/core/connectors/save_restore_connector.py", line 183, in load_config_and_state_dict
+    instance = instance.to(map_location)
+  File "/home/zarred/dev/asr2/.venv/lib/python3.10/site-packages/lightning/fabric/utilities/device_dtype_mixin.py", line 55, in to
+    return super().to(*args, **kwargs)
+  File "/home/zarred/dev/asr2/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1355, in to
+    return self._apply(convert)
+  File "/home/zarred/dev/asr2/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 915, in _apply
+    module._apply(fn)
+  File "/home/zarred/dev/asr2/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 915, in _apply
+    module._apply(fn)
+  File "/home/zarred/dev/asr2/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 915, in _apply
+    module._apply(fn)
+  [Previous line repeated 2 more times]
+  File "/home/zarred/dev/asr2/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 942, in _apply
+    param_applied = fn(param)
+  File "/home/zarred/dev/asr2/.venv/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1341, in convert
+    return t.to(
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 16.00 MiB. GPU 0 has a total capacity of 9.65 GiB of which 70.69 MiB is free. Process 1584079 has 220.00 MiB memory in use. Process 2220419 has 218.00 MiB memory in use. Process 3055128 has 218.00 MiB memory in use. Process 2982546 has 927.63 MiB memory in use. Process 3095725 has 218.00 MiB memory in use. Process 1510654 has 218.00 MiB memory in use. Process 3163666 has 536.88 MiB memory in use. Process 92758 has 2.63 GiB memory in use. Including non-PyTorch memory, this process has 1.03 GiB memory in use. Of the allocated memory 840.51 MiB is allocated by PyTorch, and 1.49 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
